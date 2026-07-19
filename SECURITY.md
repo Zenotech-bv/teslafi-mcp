@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| 2.1.x | Yes |
-| < 2.1 | No |
+| 2.2.x | Yes |
+| < 2.2 | No |
 
 Only the latest release receives security fixes. Please upgrade before
 reporting an issue against an older version.
@@ -63,9 +63,10 @@ opt-in: `TESLAFI_ENABLE_COMMANDS=true` (accepted truthy values: `true`, `1`,
 `yes`) on this server **and** per-command enablement on TeslaFi's Commands
 tab. Keep both off if you only need read-only access.
 
-Even when enabled, commands are validated against a fixed local allowlist:
-unknown commands and unknown parameter keys are rejected by this server before
-any network request, and the reserved `token`, `command`, and `wake` query
-keys can never be supplied as command parameters. Commands are also never
+Even when enabled, commands are validated against a fixed local allowlist
+(matching TeslaFi's official API documentation): unknown commands and unknown
+parameter keys are rejected by this server before any network request, and
+the reserved `token`, `command`, `wake`, and `noWake` query keys can never be
+supplied as command parameters. Commands are also never
 retried once the request may have reached TeslaFi, so a transient network
 error cannot cause a command to execute twice.

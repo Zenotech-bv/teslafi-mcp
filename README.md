@@ -48,9 +48,13 @@ the underlying data in ways no fixed dashboard can.
 **Vehicle commands** (only with the explicit opt-in — see below)
 
 - "Warm the cabin to 21 °C."
+- "Turn on the driver's seat heater, full blast."
 - "Set the charge limit to 90% for tomorrow's long trip."
 - "Flash the lights so I can find the car in this car park."
 - "Lock the car."
+- "The car's asleep — wake it and start charging." (waking must be asked for
+  explicitly; a plain command never wakes a sleeping car)
+- "How much of my monthly TeslaFi command quota have I used?"
 
 ## Tools
 
@@ -62,7 +66,7 @@ the underlying data in ways no fixed dashboard can.
 | `tesla_get_trips_for_month` | All drives in a given calendar month, normalized. |
 | `tesla_analyze_home_work_trips` | Count home-to-work and work-to-home commutes in a month (e.g. Home ↔ Acme HQ). |
 | `tesla_get_locations` | Unique named locations and visit counts derived from drive history. |
-| `tesla_send_command` | Send a vehicle control command — **disabled by default**, see [Vehicle commands](#vehicle-commands-opt-in). |
+| `tesla_send_command` | Send a vehicle control command — **disabled by default**, see [Vehicle commands](#vehicle-commands-opt-in). Car commands **never wake a sleeping car** unless you pass `wake_seconds` or `no_wake: false`. |
 
 ### Compact output and `include_raw`
 
@@ -160,41 +164,107 @@ to your car. To use it you must:
 
 #### Supported commands
 
-Commands are validated against a **fixed local allowlist** — the 18 commands
-below. Anything not on the list, any parameter key not valid for the given
-command, and the reserved keys `token`, `command`, and `wake` are rejected by
-this server itself, before any network request is made. TeslaFi's own API
-documentation sits behind a login at <https://teslafi.com/api.php>, so this
-allowlist is sourced from community documentation — the
-[ha-teslafi](https://github.com/jhansche/ha-teslafi) Home Assistant
-integration — plus commands verified against a live TeslaFi account.
+Commands are validated against a **fixed local allowlist** — the 24 commands
+below, matching **TeslaFi's official API documentation** (the command list
+shown on the logged-in API settings page at <https://teslafi.com/api.php>).
+Anything not on the list, any parameter key not valid for the given command,
+and the reserved keys `token`, `command`, `wake`, and `noWake` are rejected by
+this server itself, before any network request is made. Numeric parameters are
+also value-checked locally (ranges noted below), so an out-of-range value
+never costs a quota request.
 
-Benign (wake, horn, lights, climate):
+Benign (polling, logging, horn, lights, climate):
 
 | Command | Parameters |
 | --- | --- |
-| `wake_up` | — |
-| `honk` / `honk_horn` | — |
+| `wake` | — (resume TeslaFi polling: sets the idle timer to 0 and re-enables polling) |
+| `wake_up` | — (wake the vehicle) |
+| `sleep` | `time` (optional; minutes for the sleep attempt) |
+| `enableLogging` | — |
+| `command_count` | — (read-only: current command/wake quota usage) |
+| `honk` | — |
 | `flash_lights` | — |
 | `auto_conditioning_start` / `auto_conditioning_stop` | — |
-| `set_temps` | `temp`, or `driver_temp` / `passenger_temp` |
-| `set_preconditioning_max` | `statement` |
-| `steering_wheel_heater` | `statement` |
+| `set_temps` | `temp` (Celsius, one decimal allowed; 15–28) |
+| `seat_heater` | `heater` (0 = driver, 1 = passenger, 2 = rear left, 4 = rear center, 5 = rear right — there is **no** seat `3`), `level` (0–3; `0` = off). Conditioning must be turned on first. |
+| `steering_wheel_heater` | `statement` (`true`/`false`). Conditioning must be turned on first. |
+| `set_preconditioning_max` | `statement` (`true`/`false`) — Max Defrost; when turned off, conditioning remains on |
+| `preset` | `number` (preset ID, required), `statement` (optional; `true` sends an email confirmation). The controls the preset drives must themselves be enabled. |
 
-Consequential (locks, charging, security):
+Consequential (logging off, locks, charging, security):
 
 | Command | Parameters |
 | --- | --- |
+| `disableLogging` | — (stops TeslaFi's data logging for your account) |
 | `door_lock` / `door_unlock` | — |
 | `charge_start` / `charge_stop` | — |
 | `charge_port_door_open` / `charge_port_door_close` | — |
-| `set_charge_limit` | `charge_limit_soc` |
-| `set_charging_amps` | `charging_amps` |
-| `set_sentry_mode` | `sentryMode` |
+| `set_charge_limit` | `charge_limit_soc` (50–100) |
+| `set_charging_amps` | `charging_amps` (1–80) |
+| `set_sentry_mode` | `sentryMode` (`true`/`false`) |
 
-To wake the car before a command, pass `wake_seconds` (1–120): TeslaFi wakes
-the car and waits up to that long before issuing the command, and the request
-timeout is extended to cover the wait.
+Two global modifiers control what happens when the car is asleep:
+
+- `wake_seconds` (1–60, TeslaFi's documented maximum — maps to `&wake=X`):
+  TeslaFi sends a wake and pauses up to that many seconds before issuing the
+  command; the request timeout is extended to cover the wait. Note this costs
+  a wake request from the monthly quota (see below).
+- `no_wake: true` (maps to `&noWake=true`): the command is **not sent at all**
+  while the vehicle is sleeping.
+
+> **Wake-conserving default — car commands never wake a sleeping car.**
+> For **car commands** (honk, lights, climate, seat/wheel heaters, presets,
+> charging, charge port, locks, sentry — everything that acts on the vehicle
+> itself), passing **neither** `wake_seconds` **nor** `no_wake` sends
+> `noWake=true` automatically: a sleeping car is never woken implicitly, so
+> no monthly wake request is ever spent without you asking for it. If the car
+> was asleep, the tool output states the command was **not** sent and lists
+> the options (retry with `wake_seconds`, or wait until the car wakes).
+> To wake the car, pass `wake_seconds`; to restore TeslaFi's own default
+> (wake the car and pause up to 15 s), pass `no_wake: false` explicitly.
+> Account-side commands (`wake`, `wake_up`, `sleep`, `enableLogging`,
+> `disableLogging`, `command_count`) are handled by TeslaFi itself and never
+> take `noWake` (`no_wake: true` on them is rejected locally).
+
+The two modifiers are mutually exclusive; supplying both is rejected locally
+with a clear error.
+
+#### Command quotas
+
+TeslaFi allows **500 command requests and 50 wake requests per month**,
+resetting on the 1st. A command issued while the car is asleep costs
+**1 command + 1 wake**; if the wake quota is exhausted while the car is
+asleep, the command is not sent and the API returns an error. Every command
+and data response embeds a `tesla_request_counter` object
+(`{"commands": N, "wakes": N, ...}`), updated immediately on API command
+calls and otherwise every 30 minutes. This server surfaces it as a
+`Quota: N/500 commands, M/50 wakes used this month` line in the
+`tesla_send_command` and `tesla_get_current_data` markdown output (and it is
+present in the structured output whenever TeslaFi includes it); the
+`command_count` command returns the counters on demand.
+
+The server is quota-careful on top of that:
+
+- **Wake-conserving default** — car commands never spend a wake request
+  implicitly; see the wake-conserving default above.
+- **High-usage warnings** — the server remembers the last
+  `tesla_request_counter` it saw (from any command or data response,
+  in memory only). Once usage reaches **80%** of an allowance
+  (≥ 400/500 commands or ≥ 40/50 wakes), every `tesla_send_command`
+  markdown result is prefixed with a warning line such as
+  `WARNING: 43/50 monthly wake requests used`.
+- **Proactive rate-limit pacing** — data responses also embed a `rate_limit`
+  object (`{"limit": 15, "remaining": N, "reset_in_seconds": N}`). When the
+  last response reported `remaining: 0`, the server waits out the remainder
+  of the reported reset window (capped at 60 s) before the next request,
+  instead of firing one that is guaranteed to be rejected with HTTP 429.
+- **Exhausted-allowance errors are terminal** — a TeslaFi error indicating
+  the monthly command or wake allowance is used up is never retried, and is
+  surfaced as an actionable message: the command was **not** sent, the last
+  known usage, that allowances reset on the 1st of the month, and that extra
+  requests can be purchased from TeslaFi support. (TeslaFi does not document
+  the exact error payload, so the match is heuristic; ordinary auth or
+  malformed-request errors are never classified this way.)
 
 ## Performance notes
 
@@ -205,6 +275,10 @@ timeout is extended to cover the wait.
   nothing is written to disk.
 - **Request spacing** — outbound requests to TeslaFi are spaced at least 1
   second apart, to stay within TeslaFi's per-minute API request limits.
+- **Proactive rate-limit pacing** — when TeslaFi's embedded `rate_limit`
+  object last reported `remaining: 0`, the next request waits out the
+  remainder of the reported reset window (capped at 60 s) instead of firing a
+  guaranteed HTTP 429. The pacing state is in-memory only.
 - **Retries** — transient failures are retried up to 2 times with exponential
   backoff and jitter. An HTTP 429 is retried only when TeslaFi supplies a
   `Retry-After` of at most 60 s; a 429 without that header, or asking for a
@@ -214,8 +288,9 @@ timeout is extended to cover the wait.
   the request provably never reached TeslaFi (DNS/connection errors, 429
   rejections with an honored `Retry-After`) — never for mid-flight errors such
   as timeouts or resets, so a command cannot be executed twice.
-- **Wake handling** — `wake_seconds` extends the default 30 s request timeout
-  by the wake window, so wake-assisted commands don't time out spuriously.
+- **Wake handling** — `wake_seconds` (1–60 s) extends the default 30 s request
+  timeout by the wake window, so wake-assisted commands don't time out
+  spuriously.
 
 ## Privacy & Security
 

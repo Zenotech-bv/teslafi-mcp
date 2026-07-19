@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { TESLAFI_COMMAND_NAMES } from "./services/tesla-api.js";
+import {
+  MAX_WAKE_SECONDS,
+  TESLAFI_COMMAND_NAMES
+} from "./services/tesla-api.js";
 
 /** Reusable output-format field. */
 const responseFormat = z
@@ -199,10 +202,15 @@ export const SendCommandSchema = z
       .optional()
       .describe(
         "Extra command parameters, validated per command. Examples: " +
-          "{ \"charge_limit_soc\": 80 } for set_charge_limit, " +
+          "{ \"charge_limit_soc\": 80 } for set_charge_limit (50-100), " +
           "{ \"charging_amps\": 16 } for set_charging_amps, " +
-          "{ \"temp\": 21 } (or driver_temp/passenger_temp) for set_temps, " +
-          "{ \"sentryMode\": 1 } for set_sentry_mode, " +
+          "{ \"temp\": 21.5 } for set_temps (Celsius, one decimal allowed), " +
+          "{ \"heater\": 0, \"level\": 3 } for seat_heater (heater: 0=driver, " +
+          "1=passenger, 2=rear left, 4=rear center, 5=rear right - there is " +
+          "no 3; level: 0-3, 0=off), " +
+          "{ \"number\": 1, \"statement\": true } for preset, " +
+          "{ \"time\": 30 } for sleep (minutes), " +
+          "{ \"sentryMode\": true } for set_sentry_mode, " +
           "{ \"statement\": true } for steering_wheel_heater and set_preconditioning_max. " +
           "Unknown keys are rejected."
       ),
@@ -210,10 +218,27 @@ export const SendCommandSchema = z
       .number()
       .int()
       .min(1)
-      .max(120)
+      .max(MAX_WAKE_SECONDS)
       .optional()
       .describe(
-        "If set, TeslaFi wakes the car first and waits up to this many seconds before the command"
+        "If the car is asleep, TeslaFi sends a wake and pauses up to this " +
+          `many seconds (1-${MAX_WAKE_SECONDS}, the official maximum) before ` +
+          "the command. Costs 1 of the 50 monthly wake requests, and is the " +
+          "only way a car command will wake a sleeping car (see no_wake). " +
+          "Mutually exclusive with no_wake."
+      ),
+    no_wake: z
+      .boolean()
+      .optional()
+      .describe(
+        "If true, the command is NOT sent at all when the vehicle is " +
+          "sleeping (TeslaFi's noWake=true). This is already the DEFAULT " +
+          "for car commands: car commands never wake a sleeping car unless " +
+          "you pass wake_seconds or no_wake: false (which restores " +
+          "TeslaFi's own default of waking the car and pausing up to 15s). " +
+          "Not applicable to the account-side commands wake, wake_up, " +
+          "sleep, enableLogging, disableLogging, and command_count. " +
+          "Mutually exclusive with wake_seconds."
       ),
     response_format: responseFormat
   })

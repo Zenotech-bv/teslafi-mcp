@@ -12,34 +12,41 @@ const MAX_RETRY_AFTER_MS = 60000;
 
 /**
  * Allowlist of TeslaFi feed.php commands and the extra query parameters each
- * command accepts. Unknown commands and unknown parameter keys are rejected
- * locally, before any network request is made.
+ * command accepts, matching TeslaFi's official API documentation (the command
+ * list shown on the logged-in API settings page at https://teslafi.com/api.php).
+ * Unknown commands and unknown parameter keys are rejected locally, before any
+ * network request is made.
  *
- * Sources: the official list at https://teslafi.com/api.php requires a login,
- * so this set was verified against the ha-teslafi Home Assistant integration
- * (github.com/jhansche/ha-teslafi), plus the commands this codebase had
- * previously confirmed against a live TeslaFi account (set_sentry_mode,
- * honk_horn, driver_temp/passenger_temp for set_temps).
+ * Note: "wake" is a legal COMMAND name (resume TeslaFi polling) while also
+ * being a reserved PARAM key (the &wake=X global modifier, driven by
+ * wake_seconds). The two never collide: commands and params live in different
+ * namespaces.
  */
 export const TESLAFI_COMMAND_PARAMS = {
-  wake_up: [],
+  wake: [], // resume TeslaFi polling: idle timer 0, polling on
+  wake_up: [], // wake the vehicle
+  sleep: ["time"], // start a sleep attempt; optional minutes
+  enableLogging: [],
+  disableLogging: [],
+  command_count: [], // read-only: current command/wake quota usage
   honk: [],
-  honk_horn: [],
   flash_lights: [],
-  door_lock: [],
-  door_unlock: [],
-  charge_start: [],
-  charge_stop: [],
-  charge_port_door_open: [],
-  charge_port_door_close: [],
-  set_charge_limit: ["charge_limit_soc"],
-  set_charging_amps: ["charging_amps"],
   auto_conditioning_start: [],
   auto_conditioning_stop: [],
-  set_temps: ["temp", "driver_temp", "passenger_temp"],
+  set_temps: ["temp"], // Celsius, one decimal allowed
+  seat_heater: ["heater", "level"],
+  steering_wheel_heater: ["statement"],
   set_preconditioning_max: ["statement"],
-  set_sentry_mode: ["sentryMode"],
-  steering_wheel_heater: ["statement"]
+  preset: ["number", "statement"],
+  charge_start: [],
+  charge_stop: [],
+  set_charge_limit: ["charge_limit_soc"],
+  set_charging_amps: ["charging_amps"],
+  charge_port_door_open: [],
+  charge_port_door_close: [],
+  door_lock: [],
+  door_unlock: [],
+  set_sentry_mode: ["sentryMode"]
 } as const;
 
 export type TeslaFiCommand = keyof typeof TESLAFI_COMMAND_PARAMS;
@@ -49,8 +56,122 @@ export const TESLAFI_COMMAND_NAMES = Object.keys(TESLAFI_COMMAND_PARAMS) as [
   ...TeslaFiCommand[]
 ];
 
-/** Query keys the caller may never supply directly. */
-const RESERVED_PARAM_KEYS = new Set(["token", "command", "wake"]);
+/**
+ * Maximum value for the &wake=X global modifier (wake_seconds), per the
+ * official TeslaFi API documentation.
+ */
+export const MAX_WAKE_SECONDS = 60;
+
+/**
+ * The car-affecting subset of the allowlist: commands that act on the vehicle
+ * itself, so sending one while the car sleeps would make TeslaFi wake it
+ * (spending 1 of the 50 monthly wake requests, plus a pause of up to 15s).
+ *
+ * Wake-conserving default: when the caller passes NEITHER wake_seconds NOR
+ * no_wake for one of these commands, the server sends noWake=true — a
+ * sleeping car is never woken implicitly. Passing no_wake: false explicitly
+ * restores TeslaFi's own default (wake the car and pause up to 15s).
+ *
+ * The remaining commands (wake, wake_up, sleep, enableLogging,
+ * disableLogging, command_count) are account-side: they are handled by
+ * TeslaFi itself, never wake the car, and never take noWake (noWake on
+ * wake_up would be self-contradictory).
+ */
+export const CAR_COMMANDS: ReadonlySet<TeslaFiCommand> = new Set<TeslaFiCommand>([
+  "honk",
+  "flash_lights",
+  "auto_conditioning_start",
+  "auto_conditioning_stop",
+  "set_temps",
+  "seat_heater",
+  "steering_wheel_heater",
+  "set_preconditioning_max",
+  "preset",
+  "charge_start",
+  "charge_stop",
+  "set_charge_limit",
+  "set_charging_amps",
+  "charge_port_door_open",
+  "charge_port_door_close",
+  "door_lock",
+  "door_unlock",
+  "set_sentry_mode"
+]);
+
+/**
+ * Query keys the caller may never supply directly. "wake" and "noWake" are
+ * the global modifiers driven by the wake_seconds / no_wake tool parameters.
+ */
+const RESERVED_PARAM_KEYS = new Set(["token", "command", "wake", "noWake"]);
+
+/**
+ * feed.php "commands" that only read state: safe to retry on mid-flight
+ * failures, unlike real vehicle commands which may already have executed.
+ */
+const READ_ONLY_FEED_COMMANDS = new Set([
+  "",
+  "lastGood",
+  "lastGoodTemp",
+  "command_count"
+]);
+
+type ParamValue = string | number | boolean;
+
+/** Numeric value of a param that may arrive as a number or numeric string. */
+function paramNumber(value: ParamValue): number {
+  if (typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    return Number(value);
+  }
+  return NaN;
+}
+
+/** Rule returning an error description for an invalid value, else undefined. */
+type ParamValueRule = (value: ParamValue) => string | undefined;
+
+function integerInRange(min: number, max: number): ParamValueRule {
+  return (value) => {
+    const n = paramNumber(value);
+    return Number.isInteger(n) && n >= min && n <= max
+      ? undefined
+      : `must be an integer between ${min} and ${max}`;
+  };
+}
+
+/** Official seat_heater positions. Note there is NO seat 3. */
+const SEAT_HEATER_POSITIONS = new Set([0, 1, 2, 4, 5]);
+
+/**
+ * Per-parameter VALUE validation, applied after the per-command KEY
+ * allowlist. Catches out-of-range values locally instead of spending a
+ * monthly command-quota request on something TeslaFi or the car will refuse.
+ */
+const PARAM_VALUE_RULES: Partial<
+  Record<TeslaFiCommand, Record<string, ParamValueRule>>
+> = {
+  seat_heater: {
+    heater: (value) =>
+      SEAT_HEATER_POSITIONS.has(paramNumber(value))
+        ? undefined
+        : "must be 0 (driver), 1 (passenger), 2 (rear left), 4 (rear center), " +
+          "or 5 (rear right); there is no seat 3",
+    level: integerInRange(0, 3)
+  },
+  set_charge_limit: { charge_limit_soc: integerInRange(50, 100) },
+  set_charging_amps: { charging_amps: integerInRange(1, 80) },
+  sleep: { time: integerInRange(1, 1440) },
+  preset: { number: integerInRange(1, 99) },
+  set_temps: {
+    temp: (value) => {
+      const n = paramNumber(value);
+      return Number.isFinite(n) && n >= 15 && n <= 28
+        ? undefined
+        : "must be a Celsius temperature between 15 and 28 (one decimal allowed)";
+    }
+  }
+};
 
 /** Normalized trip shape used by the commute-analysis tools. */
 export interface Trip {
@@ -84,6 +205,24 @@ export interface LocationSummary {
   visits: number;
   as_start: number;
   as_end: number;
+}
+
+/** Last-known monthly quota counters, as reported by TeslaFi. */
+export interface QuotaUsage {
+  /** Command requests used this month (of 500). */
+  commands: number;
+  /** Wake requests used this month (of 50). */
+  wakes: number;
+  /** Date.now() timestamp of the response that carried the counters. */
+  at: number;
+}
+
+/** Last-known per-minute rate-limit state, as reported by TeslaFi. */
+interface RateLimitState {
+  remaining: number;
+  resetInSeconds: number;
+  /** Date.now() timestamp of the response that carried the rate limit. */
+  at: number;
 }
 
 /** Maximum matched trips embedded in a home/work analysis result. */
@@ -134,6 +273,10 @@ class TeslaFIAPI {
   private historyCache = new Map<string, HistoryCacheEntry>();
   private lastRequestAt = 0;
   private requestGate: Promise<void> = Promise.resolve();
+  /** Last-known monthly quota counters (in-memory only; never persisted). */
+  private lastQuota: QuotaUsage | null = null;
+  /** Last-known per-minute rate-limit state (in-memory only). */
+  private lastRateLimit: RateLimitState | null = null;
 
   constructor(apiToken: string) {
     this.apiToken = apiToken;
@@ -206,19 +349,28 @@ class TeslaFIAPI {
    *
    * The command must be in the local allowlist (TESLAFI_COMMAND_PARAMS) and
    * must be enabled on the TeslaFi "Commands" tab. Parameter keys are
-   * validated per command; unknown or reserved keys are rejected before any
-   * network request is made.
+   * validated per command (with value validation for numeric parameters);
+   * unknown or reserved keys are rejected before any network request is made.
    *
    * @param command Command name (must be a known TeslaFi command).
    * @param params  Extra command parameters (e.g. { charge_limit_soc: 80 }).
-   * @param wakeSeconds If set, TeslaFi will attempt to wake the car first and
-   *   wait up to this many seconds before issuing the command. The request
-   *   timeout is extended to cover this wait.
+   * @param wakeSeconds If set (1-60, TeslaFi's documented maximum), a sleeping
+   *   car is woken first: TeslaFi sends a wake and pauses up to this many
+   *   seconds before issuing the command. The request timeout is extended to
+   *   cover this wait. Mutually exclusive with noWake.
+   * @param noWake If true, maps to TeslaFi's noWake=true: the command is not
+   *   sent at all when the vehicle is sleeping. Mutually exclusive with
+   *   wakeSeconds. For CAR_COMMANDS, leaving BOTH wakeSeconds and noWake
+   *   unset defaults to noWake=true (wake-conserving default: a sleeping car
+   *   is never woken implicitly); pass noWake=false to restore TeslaFi's own
+   *   default (wake the car and pause up to 15s). Account-side commands never
+   *   take noWake; passing noWake=true for one is rejected locally.
    */
   async sendCommand(
     command: string,
     params: Record<string, string | number | boolean> = {},
-    wakeSeconds?: number
+    wakeSeconds?: number,
+    noWake?: boolean
   ): Promise<TeslaFiRecord> {
     // Own-property check: a plain bracket lookup would resolve prototype-
     // inherited names ("constructor", "__proto__", "toString", ...) to truthy
@@ -236,12 +388,46 @@ class TeslaFIAPI {
       );
     }
 
+    if (noWake === true && wakeSeconds !== undefined) {
+      throw new Error(
+        "wake_seconds and no_wake are mutually exclusive: wake_seconds wakes " +
+          "a sleeping car before the command, no_wake skips the command " +
+          "entirely while the car sleeps. Set only one."
+      );
+    }
+    if (
+      wakeSeconds !== undefined &&
+      (!Number.isInteger(wakeSeconds) ||
+        wakeSeconds < 1 ||
+        wakeSeconds > MAX_WAKE_SECONDS)
+    ) {
+      throw new Error(
+        `wake_seconds must be an integer between 1 and ${MAX_WAKE_SECONDS} ` +
+          "(TeslaFi's documented maximum)."
+      );
+    }
+
+    const isCarCommand = CAR_COMMANDS.has(command as TeslaFiCommand);
+    if (noWake === true && !isCarCommand) {
+      // noWake on an account-side command is self-contradictory (wake_up with
+      // noWake) or meaningless (TeslaFi handles these without the car).
+      throw new Error(
+        `no_wake does not apply to the account-side command "${command}": ` +
+          "it is only meaningful for commands that act on the car itself. " +
+          "Omit no_wake for this command."
+      );
+    }
+
     const extra: Record<string, string | number | boolean> = {};
     for (const [key, value] of Object.entries(params)) {
       if (RESERVED_PARAM_KEYS.has(key)) {
         throw new Error(
           `Parameter "${key}" is reserved and cannot be supplied directly.` +
-            (key === "wake" ? " Use wake_seconds instead." : "")
+            (key === "wake"
+              ? " Use wake_seconds instead."
+              : key === "noWake"
+                ? " Use no_wake instead."
+                : "")
         );
       }
       if (!allowedParams.includes(key)) {
@@ -252,13 +438,45 @@ class TeslaFIAPI {
               : "This command takes no parameters.")
         );
       }
+      const rule = PARAM_VALUE_RULES[command as TeslaFiCommand]?.[key];
+      if (rule) {
+        const problem = rule(value);
+        if (problem) {
+          throw new Error(
+            `Invalid value for parameter "${key}" of command "${command}": ` +
+              `${problem}.`
+          );
+        }
+      }
       extra[key] = value;
     }
 
     if (typeof wakeSeconds === "number" && wakeSeconds > 0) {
       extra.wake = wakeSeconds;
     }
+    // Wake-conserving default: for car commands with NEITHER wake_seconds NOR
+    // no_wake supplied, send noWake=true so a sleeping car is never woken
+    // implicitly (an implicit wake would silently spend 1 of the 50 monthly
+    // wake requests). An explicit noWake=false restores TeslaFi's own default
+    // (wake the car and pause up to 15s before the command).
+    const effectiveNoWake =
+      noWake === true ||
+      (isCarCommand && noWake === undefined && wakeSeconds === undefined);
+    if (effectiveNoWake) {
+      extra.noWake = "true";
+    }
     const data = await this.feedRequest(command, extra, wakeSeconds);
+
+    // Monthly-allowance exhaustion may arrive as a plain-text body rather
+    // than a JSON error envelope; classify it before the generic plain-text
+    // guard below so the caller gets the actionable message. (feedRequest's
+    // declared type hides that the payload can be a string in practice.)
+    const rawBody: unknown = data;
+    if (typeof rawBody === "string" && isMonthlyAllowanceError(rawBody)) {
+      throw new Error(
+        this.sanitize(this.allowanceExceededMessage(rawBody.trim()))
+      );
+    }
 
     // Like getCurrentData: feed.php occasionally returns plain text (login
     // page, error string) instead of a JSON object. Surface that as an error
@@ -406,6 +624,107 @@ class TeslaFIAPI {
   }
 
   // ---------------------------------------------------------------------------
+  // Quota / rate-limit tracking (in-memory only, per process)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Last-known monthly quota counters (commands/wakes + timestamp), updated
+   * from every TeslaFi response that carries a tesla_request_counter, or null
+   * when none has been seen yet this process.
+   */
+  getQuotaUsage(): QuotaUsage | null {
+    return this.lastQuota ? { ...this.lastQuota } : null;
+  }
+
+  /**
+   * Update the last-known tesla_request_counter and rate_limit state from a
+   * raw response body. TeslaFi embeds both either at the top level or beside
+   * the { response: ... } envelope. Absent or malformed fields are ignored —
+   * this must never throw and never fail a request.
+   */
+  private recordUsage(data: unknown): void {
+    const candidates = [data, (data as Record<string, unknown> | null)?.response];
+    for (const obj of candidates) {
+      if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
+        continue;
+      }
+      const record = obj as Record<string, unknown>;
+      const counter = record.tesla_request_counter;
+      if (counter && typeof counter === "object" && !Array.isArray(counter)) {
+        const commands = Number((counter as Record<string, unknown>).commands);
+        const wakes = Number((counter as Record<string, unknown>).wakes);
+        if (Number.isFinite(commands) && Number.isFinite(wakes)) {
+          this.lastQuota = { commands, wakes, at: Date.now() };
+        }
+      }
+      const rateLimit = record.rate_limit;
+      if (
+        rateLimit &&
+        typeof rateLimit === "object" &&
+        !Array.isArray(rateLimit)
+      ) {
+        const remaining = Number(
+          (rateLimit as Record<string, unknown>).remaining
+        );
+        const resetInSeconds = Number(
+          (rateLimit as Record<string, unknown>).reset_in_seconds
+        );
+        if (Number.isFinite(remaining) && Number.isFinite(resetInSeconds)) {
+          this.lastRateLimit = { remaining, resetInSeconds, at: Date.now() };
+        }
+      }
+    }
+  }
+
+  /**
+   * Proactive rate-limit pacing: when the last response reported
+   * rate_limit.remaining === 0, the next request is guaranteed to be rejected
+   * with HTTP 429 until the reported reset window has passed. Return the
+   * remaining wait (capped at 60s) instead of firing that doomed request.
+   */
+  private rateLimitDelayMs(): number {
+    const rateLimit = this.lastRateLimit;
+    if (!rateLimit || rateLimit.remaining !== 0) {
+      return 0;
+    }
+    const windowMs = Math.min(
+      rateLimit.resetInSeconds * 1000,
+      MAX_RETRY_AFTER_MS
+    );
+    return Math.max(0, windowMs - (Date.now() - rateLimit.at));
+  }
+
+  /**
+   * Actionable message for an exhausted monthly command/wake allowance,
+   * embedding the last-known usage when available.
+   */
+  private allowanceExceededMessage(originalText: string): string {
+    const usage = this.lastQuota;
+    const usageNote = usage
+      ? ` Last known usage: ${usage.commands}/500 commands, ` +
+        `${usage.wakes}/50 wakes.`
+      : "";
+    return (
+      "TeslaFi monthly allowance exceeded — the command was NOT sent. " +
+      `TeslaFi reported: "${originalText}".${usageNote} ` +
+      "Allowances (500 command + 50 wake requests) reset on the 1st of the " +
+      "month; extra requests can be purchased from TeslaFi support."
+    );
+  }
+
+  /**
+   * Convert a TeslaFi-reported API error string into an Error, classifying
+   * monthly-allowance exhaustion as a terminal, actionable failure. These
+   * errors come from resolved (2xx) responses, so they are never retried.
+   */
+  private apiError(text: string): Error {
+    if (isMonthlyAllowanceError(text)) {
+      return new Error(this.sanitize(this.allowanceExceededMessage(text)));
+    }
+    return new Error(this.sanitize(text));
+  }
+
+  // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
 
@@ -483,15 +802,20 @@ class TeslaFIAPI {
     extraParams: Record<string, string | number | boolean> = {},
     wakeSeconds?: number
   ): Promise<TeslaFiRecord> {
-    // Extend the timeout to cover TeslaFi's wake-and-wait window plus buffer.
+    // Extend the timeout to cover TeslaFi's wake-and-wait window (up to
+    // MAX_WAKE_SECONDS = 60s, the official maximum) plus buffer.
     const timeoutMs =
       DEFAULT_TIMEOUT_MS +
       (typeof wakeSeconds === "number" && wakeSeconds > 0
         ? wakeSeconds * 1000
         : 0);
-    const mutating = command !== "" && command !== "lastGood" && command !== "lastGoodTemp";
+    // command_count only reads the quota counters, so it retries like a read.
+    const mutating = !READ_ONLY_FEED_COMMANDS.has(command);
     const context: RequestContext = {
-      what: mutating ? `command "${command}"` : "vehicle data",
+      what:
+        command === "" || command === "lastGood" || command === "lastGoodTemp"
+          ? "vehicle data"
+          : `command "${command}"`,
       mutating,
       timeoutMs
     };
@@ -519,6 +843,9 @@ class TeslaFIAPI {
         context
       );
 
+      // Track quota counters / rate limit from every response that carries
+      // them — before unwrap, so an error envelope still updates the state.
+      this.recordUsage(response.data);
       return this.unwrap(response.data);
     } catch (error) {
       throw this.handleError(error, context);
@@ -585,6 +912,10 @@ class TeslaFIAPI {
         context
       );
 
+      // History payloads normally carry no counters, but recording is a
+      // harmless no-op when absent and keeps the rule simple: every response
+      // that carries usage data updates the last-known state.
+      this.recordUsage(response.data);
       return this.toRecordArray(this.unwrap(response.data), what);
     } catch (error) {
       throw this.handleError(error, context);
@@ -662,7 +993,12 @@ class TeslaFIAPI {
     }
   }
 
-  /** Enforce a minimum spacing between outbound requests (in-memory gate). */
+  /**
+   * Enforce a minimum spacing between outbound requests (in-memory gate),
+   * plus proactive rate-limit pacing: when TeslaFi last reported
+   * rate_limit.remaining === 0, wait out the remainder of the reported reset
+   * window (capped at 60s) instead of firing a guaranteed 429.
+   */
   private throttle(): Promise<void> {
     const previous = this.requestGate;
     let release: () => void = () => undefined;
@@ -671,8 +1007,9 @@ class TeslaFIAPI {
     });
     return previous
       .then(() => {
-        const waitMs =
+        const spacingMs =
           MIN_REQUEST_SPACING_MS - (Date.now() - this.lastRequestAt);
+        const waitMs = Math.max(spacingMs, this.rateLimitDelayMs());
         return waitMs > 0 ? sleep(waitMs) : undefined;
       })
       .then(() => {
@@ -688,12 +1025,12 @@ class TeslaFIAPI {
   private unwrap(data: any): any {
     if (data && typeof data === "object" && !Array.isArray(data)) {
       if (data.error) {
-        throw new Error(
-          this.sanitize(
-            `TeslaFi API error: ${data.error}${
-              data.error_description ? ` - ${data.error_description}` : ""
-            }`
-          )
+        // apiError classifies monthly-allowance exhaustion as terminal with
+        // an actionable message; everything else keeps the plain error text.
+        throw this.apiError(
+          `TeslaFi API error: ${data.error}${
+            data.error_description ? ` - ${data.error_description}` : ""
+          }`
         );
       }
       if ("response" in data) {
@@ -705,13 +1042,21 @@ class TeslaFIAPI {
             );
           }
           if (inner.result === false) {
-            throw new Error(
-              this.sanitize(
-                String(
-                  inner.reason || inner.string || "TeslaFi API request failed."
-                )
+            throw this.apiError(
+              String(
+                inner.reason || inner.string || "TeslaFi API request failed."
               )
             );
+          }
+          // TeslaFi embeds a monthly quota counter in every command/data
+          // response. When it sits on the envelope rather than the inner
+          // object, carry it across so unwrapping never drops it (an existing
+          // inner counter is never overwritten).
+          if (
+            "tesla_request_counter" in data &&
+            !("tesla_request_counter" in inner)
+          ) {
+            inner.tesla_request_counter = data.tesla_request_counter;
           }
         }
         return inner;
@@ -933,6 +1278,72 @@ function classifyForRetry(error: unknown, mutating: boolean): RetryVerdict {
     default:
       return { retryable: false };
   }
+}
+
+/**
+ * Heuristic: does a TeslaFi error text indicate the MONTHLY command or wake
+ * allowance (500 commands / 50 wakes, reset on the 1st) is exhausted?
+ *
+ * ASSUMPTION: TeslaFi does not document the exact payload of this error — the
+ * docs only state that with the wake allowance exhausted a command to a
+ * sleeping car is not sent and "the API returns an error". We therefore match
+ * permissively on limit/allowance/exceeded/wake-count style phrasing, while
+ * explicitly excluding auth/permission errors so an invalid token or a
+ * command that is not enabled is never misclassified. When in doubt this
+ * returns false and ordinary error handling applies.
+ */
+export function isMonthlyAllowanceError(text: string): boolean {
+  if (typeof text !== "string" || text.trim() === "") {
+    return false;
+  }
+  // Auth / permission / malformed-request errors are never allowance errors,
+  // even when they happen to mention a limit.
+  if (/\b(token|unauthorized|not enabled|log ?in|logged|credential|password)\b/i.test(text)) {
+    return false;
+  }
+  return (
+    /\b(allowance|quota)\b/i.test(text) ||
+    (/\bmonth(ly)?\b/i.test(text) &&
+      /\b(limit|maximum|cap|exceed\w*)\b/i.test(text)) ||
+    (/\b(wake|command)s?\b[^.]{0,40}\b(count|limit|requests?)\b/i.test(text) &&
+      /\b(exceed\w*|exhaust\w*|reached|maximum|over)\b/i.test(text)) ||
+    (/\bexceed\w*\b/i.test(text) && /\b(wake|command)s?\b/i.test(text))
+  );
+}
+
+/**
+ * Heuristic: does a TeslaFi command response (or error message) indicate the
+ * command was NOT sent because the vehicle was asleep with noWake in effect?
+ *
+ * ASSUMPTION: TeslaFi does not document the exact unsent/asleep payload, so
+ * this matches permissively: the word "unsent", or asleep/sleeping phrasing
+ * combined with a not-sent / noWake indication. Used only to add explanatory
+ * feedback to tool output — never for control flow that could re-send a
+ * command.
+ */
+export function indicatesUnsentAsleep(value: unknown): boolean {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value) ?? "";
+    } catch {
+      return false;
+    }
+  }
+  if (!text) {
+    return false;
+  }
+  if (/\bunsent\b/i.test(text)) {
+    return true;
+  }
+  const mentionsAsleep = /\b(asleep|sleeping)\b/i.test(text);
+  const mentionsNotSent =
+    /\b(not|never|wasn'?t|couldn'?t|won'?t)\b[^"]{0,40}\bsen[dt]\b/i.test(
+      text
+    ) || /\bno[_ ]?wake\b/i.test(text);
+  return mentionsAsleep && mentionsNotSent;
 }
 
 /** Parse a Retry-After header (delta-seconds or HTTP date) to milliseconds. */

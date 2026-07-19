@@ -226,17 +226,36 @@ describe("tool registration", () => {
   it("rejects unknown commands at the schema layer, before the handler runs", () => {
     const { config } = captured.tools.get("tesla_send_command")!;
     expect(() => config.inputSchema.parse({ command: "self_destruct" })).toThrow();
+    // honk_horn was removed in the official-docs alignment (2.2.0).
+    expect(() => config.inputSchema.parse({ command: "honk_horn" })).toThrow();
     expect(() => config.inputSchema.parse({ command: "wake_up" })).not.toThrow();
+    // Commands added in the official-docs alignment parse fine.
+    for (const command of ["wake", "sleep", "seat_heater", "preset", "command_count"]) {
+      expect(() => config.inputSchema.parse({ command })).not.toThrow();
+    }
   });
 
-  it("caps wake_seconds at 120 in the schema", () => {
+  it("caps wake_seconds at the official maximum of 60 in the schema", () => {
     const { config } = captured.tools.get("tesla_send_command")!;
     expect(() =>
-      config.inputSchema.parse({ command: "wake_up", wake_seconds: 121 })
+      config.inputSchema.parse({ command: "wake_up", wake_seconds: 61 })
     ).toThrow();
     expect(() =>
       config.inputSchema.parse({ command: "wake_up", wake_seconds: 120 })
+    ).toThrow(); // the pre-2.2.0 maximum is no longer accepted
+    expect(() =>
+      config.inputSchema.parse({ command: "wake_up", wake_seconds: 60 })
     ).not.toThrow();
+  });
+
+  it("accepts the no_wake boolean in the schema", () => {
+    const { config } = captured.tools.get("tesla_send_command")!;
+    expect(() =>
+      config.inputSchema.parse({ command: "charge_start", no_wake: true })
+    ).not.toThrow();
+    expect(() =>
+      config.inputSchema.parse({ command: "charge_start", no_wake: "yes" })
+    ).toThrow();
   });
 });
 
@@ -343,6 +362,294 @@ describe("TESLAFI_ENABLE_COMMANDS gating", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Wake modifiers and quota surfacing through the full tool path
+// ---------------------------------------------------------------------------
+
+describe("tesla_send_command wake modifiers and quota", () => {
+  beforeEach(() => {
+    process.env.TESLAFI_ENABLE_COMMANDS = "true";
+  });
+
+  it("passes no_wake through as noWake=true", async () => {
+    await callTool("tesla_send_command", {
+      command: "charge_start",
+      no_wake: true
+    });
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    const cfg = mockAxios.mock.calls[0][0] as any;
+    expect(cfg.params.noWake).toBe("true");
+    expect(cfg.params).not.toHaveProperty("wake");
+  });
+
+  it("rejects no_wake combined with wake_seconds locally, with no network call", async () => {
+    const result = await callTool("tesla_send_command", {
+      command: "charge_start",
+      wake_seconds: 30,
+      no_wake: true
+    });
+    expect(text(result)).toMatch(
+      /^Error: wake_seconds and no_wake are mutually exclusive/
+    );
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("rejects seat_heater heater=3 through the full tool path", async () => {
+    const result = await callTool("tesla_send_command", {
+      command: "seat_heater",
+      params: { heater: 3, level: 2 }
+    });
+    expect(text(result)).toMatch(/^Error: /);
+    expect(text(result)).toMatch(/there is no seat 3/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("appends the quota line when the response embeds tesla_request_counter", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true, reason: "" },
+        tesla_request_counter: { commands: 12, wakes: 3 }
+      }
+    });
+
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain(
+      "Quota: 12/500 commands, 3/50 wakes used this month"
+    );
+    // The counter rides along in structured output.
+    expect(result.structuredContent.tesla_request_counter).toEqual({
+      commands: 12,
+      wakes: 3
+    });
+  });
+
+  it("renders string counter values from TeslaFi's JSON", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true },
+        tesla_request_counter: { commands: "499", wakes: "50" }
+      }
+    });
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain(
+      "Quota: 499/500 commands, 50/50 wakes used this month"
+    );
+  });
+
+  it("omits the quota line, without failing, when the counter is absent", async () => {
+    // defaultRoute returns a command response with no tesla_request_counter.
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain("# Command: honk");
+    expect(text(result)).not.toContain("Quota:");
+  });
+
+  it("omits the quota line for a malformed counter instead of failing", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true },
+        tesla_request_counter: { commands: "not-a-number" }
+      }
+    });
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain("# Command: honk");
+    expect(text(result)).not.toContain("Quota:");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wake-conserving default through the full tool path
+// ---------------------------------------------------------------------------
+
+describe("tesla_send_command wake-conserving default", () => {
+  beforeEach(() => {
+    process.env.TESLAFI_ENABLE_COMMANDS = "true";
+  });
+
+  it("defaults car commands to noWake=true when neither wake param is given", async () => {
+    await callTool("tesla_send_command", { command: "charge_start" });
+    const cfg = mockAxios.mock.calls[0][0] as any;
+    expect(cfg.params.noWake).toBe("true");
+    expect(cfg.params).not.toHaveProperty("wake");
+  });
+
+  it("never appends noWake to account-side commands", async () => {
+    await callTool("tesla_send_command", { command: "wake_up" });
+    const cfg = mockAxios.mock.calls[0][0] as any;
+    expect(cfg.params).not.toHaveProperty("noWake");
+  });
+
+  it("no_wake: false restores TeslaFi's own wake-and-wait default (no noWake sent)", async () => {
+    await callTool("tesla_send_command", {
+      command: "charge_start",
+      no_wake: false
+    });
+    const cfg = mockAxios.mock.calls[0][0] as any;
+    expect(cfg.params).not.toHaveProperty("noWake");
+    expect(cfg.params).not.toHaveProperty("wake");
+  });
+
+  it("wake_seconds sends wake=X without noWake", async () => {
+    await callTool("tesla_send_command", {
+      command: "charge_start",
+      wake_seconds: 20
+    });
+    const cfg = mockAxios.mock.calls[0][0] as any;
+    expect(cfg.params.wake).toBe(20);
+    expect(cfg.params).not.toHaveProperty("noWake");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Asleep-unsent feedback
+// ---------------------------------------------------------------------------
+
+describe("asleep-unsent feedback", () => {
+  beforeEach(() => {
+    process.env.TESLAFI_ENABLE_COMMANDS = "true";
+  });
+
+  it("explains an unsent-asleep result and the wake options", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: { response: { result: "unsent", reason: "vehicle asleep" } }
+    });
+    const result = await callTool("tesla_send_command", {
+      command: "charge_start"
+    });
+    const md = text(result);
+    expect(md).toContain("# Command: charge_start");
+    expect(md).toContain("NOT sent");
+    expect(md).toContain("wake_seconds");
+    expect(md).toContain("50 monthly wake requests");
+    expect(md).toContain("wait until the car is awake");
+  });
+
+  it("appends the guidance when TeslaFi reports asleep/not-sent as an error", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        response: {
+          result: false,
+          reason: "Vehicle is asleep - command not sent (noWake)"
+        }
+      }
+    });
+    const result = await callTool("tesla_send_command", {
+      command: "door_lock"
+    });
+    const md = text(result);
+    expect(md).toMatch(/^Error: /);
+    expect(md).toContain("NOT sent");
+    expect(md).toContain("wake_seconds");
+    expect(md).toContain("50 monthly wake requests");
+  });
+
+  it("adds no asleep note to a normal success", async () => {
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain("# Command: honk");
+    expect(text(result)).not.toContain("NOT sent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quota usage warnings (>= 400/500 commands, >= 40/50 wakes)
+// ---------------------------------------------------------------------------
+
+describe("quota usage warnings", () => {
+  beforeEach(() => {
+    process.env.TESLAFI_ENABLE_COMMANDS = "true";
+  });
+
+  /** Route every command to a response carrying the given counters. */
+  function counters(commands: number | string, wakes: number | string) {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true },
+        tesla_request_counter: { commands, wakes }
+      }
+    });
+  }
+
+  it("prepends a command-usage warning at exactly 400/500", async () => {
+    counters(400, 5);
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(
+      text(result).startsWith(
+        "WARNING: 400/500 monthly command requests used"
+      )
+    ).toBe(true);
+    expect(text(result)).not.toContain("monthly wake requests used");
+  });
+
+  it("prepends a wake-usage warning at exactly 40/50", async () => {
+    counters(12, 40);
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(
+      text(result).startsWith("WARNING: 40/50 monthly wake requests used")
+    ).toBe(true);
+    expect(text(result)).not.toContain("monthly command requests used");
+  });
+
+  it("shows no warnings at 399 commands / 39 wakes", async () => {
+    counters(399, 39);
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).not.toContain("WARNING:");
+    expect(text(result)).toContain("# Command: honk");
+    expect(text(result)).toContain(
+      "Quota: 399/500 commands, 39/50 wakes used this month"
+    );
+  });
+
+  it("shows both warnings when both thresholds are crossed", async () => {
+    counters(500, 50);
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain(
+      "WARNING: 500/500 monthly command requests used"
+    );
+    expect(text(result)).toContain(
+      "WARNING: 50/50 monthly wake requests used"
+    );
+  });
+
+  it("uses counters remembered from a DATA response for a later command without any", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        ...FEED_DATA,
+        tesla_request_counter: { commands: 450, wakes: 41 }
+      }
+    });
+    await callTool("tesla_get_current_data");
+
+    // The command response itself carries NO counter; the warning must come
+    // from the usage remembered from the data response above.
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    const result = await callTool("tesla_send_command", { command: "honk" });
+    expect(text(result)).toContain(
+      "WARNING: 450/500 monthly command requests used"
+    );
+    expect(text(result)).toContain(
+      "WARNING: 41/50 monthly wake requests used"
+    );
+    expect(text(result)).not.toContain("Quota:"); // no counter on THIS response
+  });
+
+  it("keeps JSON output parseable (warnings are markdown-only)", async () => {
+    counters(500, 50);
+    const result = await callTool("tesla_send_command", {
+      command: "honk",
+      response_format: "json"
+    });
+    expect(() => JSON.parse(text(result))).not.toThrow();
+    expect(text(result)).not.toContain("WARNING:");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Per-tool happy paths
 // ---------------------------------------------------------------------------
 
@@ -364,6 +671,29 @@ describe("tesla_get_current_data", () => {
   it("passes source through to feed.php", async () => {
     await callTool("tesla_get_current_data", { source: "lastGood" });
     expect((mockAxios.mock.calls[0][0] as any).params.command).toBe("lastGood");
+  });
+
+  it("omits the quota line when the feed data has no tesla_request_counter", async () => {
+    const result = await callTool("tesla_get_current_data");
+    expect(text(result)).not.toContain("Quota:");
+  });
+
+  it("appends the quota line when the feed data embeds tesla_request_counter", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockResolvedValue({
+      data: {
+        ...FEED_DATA,
+        tesla_request_counter: { commands: 101, wakes: 7 }
+      }
+    });
+    const result = await callTool("tesla_get_current_data");
+    expect(text(result)).toContain(
+      "Quota: 101/500 commands, 7/50 wakes used this month"
+    );
+    expect(result.structuredContent.tesla_request_counter).toEqual({
+      commands: 101,
+      wakes: 7
+    });
   });
 
   it("returns JSON when requested", async () => {

@@ -20,7 +20,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import TeslaFIAPI, { TeslaFiRecord } from "./services/tesla-api.js";
+import TeslaFIAPI, {
+  indicatesUnsentAsleep,
+  TeslaFiRecord
+} from "./services/tesla-api.js";
 import {
   AnalyzeHomeWorkTripsSchema,
   AnalyzeHomeWorkTripsInput,
@@ -41,7 +44,7 @@ import {
 // Initialize MCP server
 const server = new McpServer({
   name: "teslafi-mcp",
-  version: "2.1.0"
+  version: "2.2.0"
 });
 
 let teslaAPI: TeslaFIAPI;
@@ -83,6 +86,67 @@ function errorResult(error: unknown) {
   const errorMsg = error instanceof Error ? error.message : String(error);
   return toolResult(`Error: ${errorMsg}`);
 }
+
+/**
+ * Render TeslaFi's embedded monthly quota counter ("tesla_request_counter",
+ * present on command and data responses) as a concise markdown line, or null
+ * when the field is absent or malformed. TeslaFi allows 500 command requests
+ * and 50 wake requests per month, reset on the 1st. Never throws.
+ */
+function quotaLine(data: unknown): string | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  const counter = (data as Record<string, unknown>).tesla_request_counter;
+  if (counter === null || typeof counter !== "object" || Array.isArray(counter)) {
+    return null;
+  }
+  const commands = Number((counter as Record<string, unknown>).commands);
+  const wakes = Number((counter as Record<string, unknown>).wakes);
+  if (!Number.isFinite(commands) || !Number.isFinite(wakes)) {
+    return null;
+  }
+  return `Quota: ${commands}/500 commands, ${wakes}/50 wakes used this month`;
+}
+
+/** Warn when monthly usage reaches 80% of an allowance. */
+const COMMAND_WARN_THRESHOLD = 400; // of 500 monthly command requests
+const WAKE_WARN_THRESHOLD = 40; // of 50 monthly wake requests
+
+/**
+ * Warning lines for high monthly usage, based on the last-known
+ * tesla_request_counter tracked by the API client (updated from every
+ * response that carries one — command and data responses alike). Empty when
+ * no counters have been seen or usage is below both thresholds.
+ */
+function quotaWarnings(): string[] {
+  const usage = teslaAPI.getQuotaUsage();
+  if (!usage) {
+    return [];
+  }
+  const warnings: string[] = [];
+  if (usage.commands >= COMMAND_WARN_THRESHOLD) {
+    warnings.push(
+      `WARNING: ${usage.commands}/500 monthly command requests used`
+    );
+  }
+  if (usage.wakes >= WAKE_WARN_THRESHOLD) {
+    warnings.push(`WARNING: ${usage.wakes}/50 monthly wake requests used`);
+  }
+  return warnings;
+}
+
+/**
+ * Feedback appended when TeslaFi reports a command was not sent because the
+ * vehicle was asleep with noWake in effect (the wake-conserving default for
+ * car commands).
+ */
+const ASLEEP_UNSENT_NOTE =
+  "The command was NOT sent: the vehicle was asleep and noWake was in effect " +
+  "(the default for car commands — a sleeping car is never woken implicitly). " +
+  "Either retry with wake_seconds to wake the car first (this costs 1 of the " +
+  "50 monthly wake requests), or wait until the car is awake and send the " +
+  "command again.";
 
 function monthName(year: number, month: number): string {
   return new Date(year, month - 1).toLocaleString("en-US", {
@@ -420,6 +484,13 @@ Example: "What's my car's battery level right now?"`,
         `- **Data timestamp**: ${pick("Date")}`
       ];
 
+      // Surface TeslaFi's monthly quota counter when the response embeds it
+      // (it is part of `data`, so structured output carries it too).
+      const quota = quotaLine(data);
+      if (quota) {
+        lines.push("", quota);
+      }
+
       return toolResult(lines.join("\n"), data);
     } catch (error) {
       return errorResult(error);
@@ -623,26 +694,60 @@ set to "true" (the 'Enable vehicle commands' extension setting). The command
 must also be enabled on the TeslaFi "Commands" tab (https://teslafi.com/api.php),
 or it will fail. This changes vehicle state — use with care.
 
-Supported commands and parameters (validated locally; unknown commands and
-parameters are rejected without a network call):
-  - wake_up
+Supported commands and parameters, matching TeslaFi's official API
+documentation (validated locally; unknown commands and parameters are
+rejected without a network call):
+  - wake                        (resume TeslaFi polling: idle timer 0, polling on)
+  - wake_up                     (wake the vehicle)
+  - sleep                       params: { "time": 30 } (optional, minutes for the sleep attempt)
+  - enableLogging / disableLogging
+  - command_count               (read-only: current command/wake quota usage)
+  - honk / flash_lights
   - door_lock / door_unlock
   - charge_start / charge_stop
   - charge_port_door_open / charge_port_door_close
-  - set_charge_limit            params: { "charge_limit_soc": 80 }
+  - set_charge_limit            params: { "charge_limit_soc": 80 } (50-100)
   - set_charging_amps           params: { "charging_amps": 16 }
   - auto_conditioning_start / auto_conditioning_stop
-  - set_temps                   params: { "temp": 21 } or { "driver_temp": 21, "passenger_temp": 21 }
-  - set_preconditioning_max     params: { "statement": true }
-  - set_sentry_mode             params: { "sentryMode": 1 }
-  - steering_wheel_heater       params: { "statement": true }
-  - honk / honk_horn / flash_lights
+  - set_temps                   params: { "temp": 21.5 } (Celsius, one decimal allowed)
+  - seat_heater                 params: { "heater": 0, "level": 3 } (heater: 0=driver,
+    1=passenger, 2=rear left, 4=rear center, 5=rear right — there is no 3;
+    level: 0-3, 0=off; conditioning must be on first)
+  - steering_wheel_heater       params: { "statement": true } (conditioning must be on first)
+  - preset                      params: { "number": 1, "statement": true } (conditioning
+    preset; statement=true emails a confirmation; the controls the preset
+    drives must themselves be enabled)
+  - set_preconditioning_max     params: { "statement": true } (Max Defrost; when
+    turned off, conditioning remains on)
+  - set_sentry_mode             params: { "sentryMode": true }
+
+WAKE-CONSERVING DEFAULT: car commands (honk, lights, climate, charging,
+locks, charge port, sentry) never wake a sleeping car unless you pass
+wake_seconds or no_wake: false — with neither given, noWake=true is sent
+automatically, and if the car is asleep the command is NOT sent (the output
+says so and explains the options). Account-side commands (wake, wake_up,
+sleep, enableLogging, disableLogging, command_count) are exempt and never
+take noWake.
 
 Args:
   - command (string): Command name from the list above (required)
   - params (object, optional): Command parameters (see above)
-  - wake_seconds (number, optional): Wake the car first, waiting up to N seconds (1-120)
+  - wake_seconds (number, optional): If the car is asleep, TeslaFi wakes it and
+    waits up to N seconds (1-60, the official maximum) before the command.
+    Costs a monthly wake request. Mutually exclusive with no_wake.
+  - no_wake (boolean, optional): true sends TeslaFi's noWake=true (the command
+    is NOT sent at all while the car sleeps) — already the default for car
+    commands; false restores TeslaFi's own default (wake the car and pause up
+    to 15s). Mutually exclusive with wake_seconds.
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
+
+Quotas: TeslaFi allows 500 command requests + 50 wake requests per month
+(reset on the 1st). A command sent while the car is asleep costs 1 command +
+1 wake; with the wake quota exhausted, the command is not sent and TeslaFi
+returns an error — surfaced here as a terminal, actionable message (never
+retried). Responses embed a tesla_request_counter object, surfaced as a
+"Quota: ..." line; at >= 400/500 commands or >= 40/50 wakes a WARNING line
+is prepended to the output.
 
 Example: "Set my charge limit to 80%" → command=set_charge_limit, params={charge_limit_soc:80}`,
     inputSchema: SendCommandSchema,
@@ -662,22 +767,40 @@ Example: "Set my charge limit to 80%" → command=set_charge_limit, params={char
       const result = await teslaAPI.sendCommand(
         params.command,
         params.params ?? {},
-        params.wake_seconds
+        params.wake_seconds,
+        params.no_wake
       );
 
       if (params.response_format === "json") {
         return toolResult(JSON.stringify(result, null, 2), result);
       }
 
-      const lines = [
-        `# Command: ${params.command}`,
-        "",
-        "```json",
-        JSON.stringify(result, null, 2),
-        "```"
-      ];
+      const lines: string[] = [];
+      // High-usage warnings come first (>= 400/500 commands or 40/50 wakes),
+      // fed by the client's last-known counters across all responses.
+      const warnings = quotaWarnings();
+      if (warnings.length > 0) {
+        lines.push(...warnings, "");
+      }
+      lines.push(`# Command: ${params.command}`, "");
+      if (indicatesUnsentAsleep(result)) {
+        lines.push(ASLEEP_UNSENT_NOTE, "");
+      }
+      lines.push("```json", JSON.stringify(result, null, 2), "```");
+      // Surface TeslaFi's monthly quota counter when the response embeds it
+      // (it is part of `result`, so structured output carries it too).
+      const quota = quotaLine(result);
+      if (quota) {
+        lines.push("", quota);
+      }
       return toolResult(lines.join("\n"), result);
     } catch (error) {
+      // TeslaFi may report "asleep, not sent" as an error envelope rather
+      // than a result object; keep the explanatory feedback in that shape too.
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (indicatesUnsentAsleep(errorMsg)) {
+        return toolResult(`Error: ${errorMsg}\n\n${ASLEEP_UNSENT_NOTE}`);
+      }
       return errorResult(error);
     }
   }

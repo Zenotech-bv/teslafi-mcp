@@ -8,6 +8,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios, { AxiosError } from "axios";
 import TeslaFIAPI, {
+  CAR_COMMANDS,
+  indicatesUnsentAsleep,
+  isMonthlyAllowanceError,
   MAX_ANALYSIS_TRIPS,
   monthToDateRange,
   TESLAFI_COMMAND_NAMES,
@@ -100,12 +103,26 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("command allowlist", () => {
-  it("exposes exactly the 18 allowlisted commands", () => {
-    expect(TESLAFI_COMMAND_NAMES).toHaveLength(18);
-    expect(new Set(TESLAFI_COMMAND_NAMES).size).toBe(18);
+  it("exposes exactly the 24 officially documented commands", () => {
+    expect(TESLAFI_COMMAND_NAMES).toHaveLength(24);
+    expect(new Set(TESLAFI_COMMAND_NAMES).size).toBe(24);
     expect(Object.keys(TESLAFI_COMMAND_PARAMS)).toEqual(
       TESLAFI_COMMAND_NAMES
     );
+    // Commands added in the official-docs alignment.
+    for (const name of [
+      "wake",
+      "sleep",
+      "enableLogging",
+      "disableLogging",
+      "seat_heater",
+      "preset",
+      "command_count"
+    ]) {
+      expect(TESLAFI_COMMAND_NAMES).toContain(name);
+    }
+    // honk_horn is not an official TeslaFi command.
+    expect(TESLAFI_COMMAND_NAMES).not.toContain("honk_horn");
   });
 
   it("rejects an unknown command locally, without a network call", async () => {
@@ -116,7 +133,14 @@ describe("command allowlist", () => {
     expect(mockAxios).not.toHaveBeenCalled();
   });
 
-  it.each(["token", "command", "wake"])(
+  it('rejects the removed community alias "honk_horn" (official name: honk)', async () => {
+    await expect(api.sendCommand("honk_horn")).rejects.toThrow(
+      /Unknown TeslaFi command "honk_horn"/
+    );
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it.each(["token", "command", "wake", "noWake"])(
     'rejects the reserved parameter key "%s" without a network call',
     async (key) => {
       await expect(
@@ -131,6 +155,28 @@ describe("command allowlist", () => {
       api.sendCommand("wake_up", { wake: 30 })
     ).rejects.toThrow(/Use wake_seconds instead/);
     expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it('points the caller at no_wake when "noWake" is supplied', async () => {
+    await expect(
+      api.sendCommand("wake_up", { noWake: true })
+    ).rejects.toThrow(/Use no_wake instead/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it('rejects the removed set_temps params "driver_temp"/"passenger_temp"', async () => {
+    await expect(
+      api.sendCommand("set_temps", { driver_temp: 21 })
+    ).rejects.toThrow(
+      /Parameter "driver_temp" is not valid for command "set_temps"/
+    );
+    await expect(
+      api.sendCommand("set_temps", { passenger_temp: 21 })
+    ).rejects.toThrow(/Parameter "passenger_temp" is not valid/);
+    // The official parameter is still accepted.
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("set_temps", { temp: 21.5 }));
+    expect(axiosConfig().params.temp).toBe(21.5);
   });
 
   it("rejects a parameter that is valid for a different command", async () => {
@@ -164,6 +210,96 @@ describe("command allowlist", () => {
       expect(mockAxios).not.toHaveBeenCalled();
     }
   );
+});
+
+// ---------------------------------------------------------------------------
+// Parameter value validation (no network)
+// ---------------------------------------------------------------------------
+
+describe("parameter value validation", () => {
+  it("rejects seat_heater heater=3 (there is no seat 3), without a network call", async () => {
+    await expect(
+      api.sendCommand("seat_heater", { heater: 3, level: 2 })
+    ).rejects.toThrow(/there is no seat 3/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it.each([[0], [1], [2], [4], [5]])(
+    "accepts seat_heater heater=%d",
+    async (heater) => {
+      mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+      await settle(api.sendCommand("seat_heater", { heater, level: 3 }));
+      expect(axiosConfig().params.heater).toBe(heater);
+      expect(axiosConfig().params.level).toBe(3);
+    }
+  );
+
+  it("accepts numeric-string seat_heater values (query-string API)", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("seat_heater", { heater: "4", level: "0" }));
+    expect(axiosConfig().params.heater).toBe("4");
+  });
+
+  it.each([[-1], [4], [1.5]])(
+    "rejects seat_heater level=%s (valid: 0-3)",
+    async (level) => {
+      await expect(
+        api.sendCommand("seat_heater", { heater: 0, level })
+      ).rejects.toThrow(/must be an integer between 0 and 3/);
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([[49], [101], [80.5]])(
+    "rejects out-of-range charge_limit_soc %s (valid: 50-100)",
+    async (soc) => {
+      await expect(
+        api.sendCommand("set_charge_limit", { charge_limit_soc: soc })
+      ).rejects.toThrow(/must be an integer between 50 and 100/);
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([[0], [81]])(
+    "rejects out-of-range charging_amps %s (valid: 1-80)",
+    async (amps) => {
+      await expect(
+        api.sendCommand("set_charging_amps", { charging_amps: amps })
+      ).rejects.toThrow(/must be an integer between 1 and 80/);
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+
+  it("rejects a non-Celsius-range set_temps temp", async () => {
+    await expect(
+      api.sendCommand("set_temps", { temp: 70 }) // Fahrenheit confusion
+    ).rejects.toThrow(/Celsius temperature between 15 and 28/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("accepts sleep with an optional time in minutes, and without one", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("sleep", { time: 30 }));
+    expect(axiosConfig().params.command).toBe("sleep");
+    expect(axiosConfig().params.time).toBe(30);
+
+    await settle(api.sendCommand("sleep"));
+    expect(axiosConfig().params).not.toHaveProperty("time");
+  });
+
+  it("rejects a non-positive sleep time", async () => {
+    await expect(api.sendCommand("sleep", { time: 0 })).rejects.toThrow(
+      /must be an integer between 1 and 1440/
+    );
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("accepts a preset by number, with the optional email confirmation", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("preset", { number: 2, statement: true }));
+    expect(axiosConfig().params.number).toBe(2);
+    expect(axiosConfig().params.statement).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -614,7 +750,7 @@ describe("redirect and proxy hardening", () => {
 // wake_seconds handling
 // ---------------------------------------------------------------------------
 
-describe("wake_seconds", () => {
+describe("wake_seconds and no_wake", () => {
   it("scales the axios timeout and adds the wake param", async () => {
     mockAxios.mockResolvedValue({ data: { response: { result: true } } });
     await settle(api.sendCommand("wake_up", {}, 45));
@@ -631,6 +767,47 @@ describe("wake_seconds", () => {
     const cfg = axiosConfig();
     expect(cfg.timeout).toBe(30000);
     expect(cfg.params).not.toHaveProperty("wake");
+  });
+
+  it("accepts the official maximum of 60", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("wake_up", {}, 60));
+    expect(axiosConfig().params.wake).toBe(60);
+    expect(axiosConfig().timeout).toBe(30000 + 60 * 1000);
+  });
+
+  it.each([[61], [120], [0], [-5], [10.5]])(
+    "rejects wake_seconds=%s at the service layer, without a network call",
+    async (seconds) => {
+      await expect(api.sendCommand("wake_up", {}, seconds)).rejects.toThrow(
+        /wake_seconds must be an integer between 1 and 60/
+      );
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+
+  it("maps no_wake to the noWake=true query param", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("charge_start", {}, undefined, true));
+
+    const cfg = axiosConfig();
+    expect(cfg.params.noWake).toBe("true");
+    expect(cfg.params).not.toHaveProperty("wake");
+    expect(cfg.timeout).toBe(30000); // no wake window to cover
+  });
+
+  it("omits noWake entirely when no_wake is explicitly false (TeslaFi's own default)", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("charge_start", {}, undefined, false));
+    expect(axiosConfig().params).not.toHaveProperty("noWake");
+    expect(axiosConfig().params).not.toHaveProperty("wake");
+  });
+
+  it("rejects wake_seconds combined with no_wake, without a network call", async () => {
+    await expect(
+      api.sendCommand("charge_start", {}, 30, true)
+    ).rejects.toThrow(/wake_seconds and no_wake are mutually exclusive/);
+    expect(mockAxios).not.toHaveBeenCalled();
   });
 
   it("reports the wake-extended timeout in command timeout errors", async () => {
@@ -651,6 +828,72 @@ describe("wake_seconds", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Wake-conserving default: car commands never wake a sleeping car implicitly
+// ---------------------------------------------------------------------------
+
+describe("wake-conserving default (CAR_COMMANDS)", () => {
+  const EXEMPT_COMMANDS = [
+    "wake",
+    "wake_up",
+    "sleep",
+    "enableLogging",
+    "disableLogging",
+    "command_count"
+  ] as const;
+
+  it("partitions the 24-command allowlist into 18 car + 6 account-side commands", () => {
+    expect(CAR_COMMANDS.size).toBe(18);
+    for (const name of TESLAFI_COMMAND_NAMES) {
+      const isCar = CAR_COMMANDS.has(name);
+      const isExempt = (EXEMPT_COMMANDS as readonly string[]).includes(name);
+      // Every command is in exactly one group.
+      expect(isCar !== isExempt, `${name} must be car XOR account-side`).toBe(
+        true
+      );
+    }
+  });
+
+  it.each([...CAR_COMMANDS].map((c) => [c]))(
+    "defaults %s to noWake=true when neither wake_seconds nor no_wake is given",
+    async (command) => {
+      mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+      await settle(api.sendCommand(command));
+      expect(axiosConfig().params.noWake).toBe("true");
+      expect(axiosConfig().params).not.toHaveProperty("wake");
+    }
+  );
+
+  it.each(EXEMPT_COMMANDS.map((c) => [c]))(
+    "never appends noWake to the account-side command %s",
+    async (command) => {
+      mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+      await settle(api.sendCommand(command));
+      expect(axiosConfig().params).not.toHaveProperty("noWake");
+    }
+  );
+
+  it("sends wake=X without noWake when wake_seconds is given for a car command", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("charge_start", {}, 20));
+    expect(axiosConfig().params.wake).toBe(20);
+    expect(axiosConfig().params).not.toHaveProperty("noWake");
+  });
+
+  it("rejects no_wake=true on an account-side command locally, without a network call", async () => {
+    await expect(
+      api.sendCommand("wake_up", {}, undefined, true)
+    ).rejects.toThrow(/no_wake does not apply to the account-side command/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("silently ignores the no-op no_wake=false on an account-side command", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("command_count", {}, undefined, false));
+    expect(axiosConfig().params).not.toHaveProperty("noWake");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Request spacing gate
 // ---------------------------------------------------------------------------
 
@@ -667,6 +910,254 @@ describe("request spacing", () => {
     await vi.advanceTimersByTimeAsync(10); // past 1000ms
     expect(mockAxios).toHaveBeenCalledTimes(2);
     await Promise.all([p1, p2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Proactive rate-limit pacing (rate_limit.remaining / reset_in_seconds)
+// ---------------------------------------------------------------------------
+
+describe("proactive rate-limit pacing", () => {
+  /** feed.php body carrying a rate_limit object. */
+  const rlBody = (remaining: unknown, resetInSeconds: unknown) => ({
+    data: {
+      battery_level: 50,
+      rate_limit: { limit: 15, remaining, reset_in_seconds: resetInSeconds }
+    }
+  });
+
+  it("waits out the reported reset window when remaining hits 0", async () => {
+    mockAxios.mockResolvedValue(rlBody(0, 30));
+    await settle(api.getCurrentData());
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+
+    const p = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(28_000);
+    expect(mockAxios).toHaveBeenCalledTimes(1); // still inside the 30s window
+    await vi.advanceTimersByTimeAsync(2_100); // past the 30s window
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await p;
+  });
+
+  it("does not wait once the reset window has already elapsed", async () => {
+    mockAxios.mockResolvedValue(rlBody(0, 5));
+    await settle(api.getCurrentData());
+    await vi.advanceTimersByTimeAsync(6_000); // window (5s) elapsed while idle
+
+    const p = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockAxios).toHaveBeenCalledTimes(2); // fired immediately
+    await p;
+  });
+
+  it("caps the pacing wait at 60s even when the reported window is longer", async () => {
+    mockAxios.mockResolvedValue(rlBody(0, 300));
+    await settle(api.getCurrentData());
+
+    const p = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(mockAxios).toHaveBeenCalledTimes(1); // inside the 60s cap
+    await vi.advanceTimersByTimeAsync(1_200); // past the cap, far before 300s
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await p;
+  });
+
+  it("applies only the 1s spacing while remaining > 0", async () => {
+    mockAxios.mockResolvedValue(rlBody(1, 30));
+    await settle(api.getCurrentData());
+
+    const p = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1_100); // just the existing 1s spacing
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await p;
+  });
+
+  it("ignores a malformed rate_limit object instead of failing or waiting", async () => {
+    mockAxios.mockResolvedValue(rlBody("not-a-number", "soon"));
+    await settle(api.getCurrentData());
+
+    const p = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1_100); // nothing beyond the 1s spacing
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await p;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quota usage tracking (tesla_request_counter memory)
+// ---------------------------------------------------------------------------
+
+describe("quota usage tracking", () => {
+  it("starts with no known usage", () => {
+    expect(api.getQuotaUsage()).toBeNull();
+  });
+
+  it("remembers counters from data responses", async () => {
+    mockAxios.mockResolvedValue({
+      data: {
+        battery_level: 72,
+        tesla_request_counter: { commands: 123, wakes: 4 }
+      }
+    });
+    await settle(api.getCurrentData());
+    expect(api.getQuotaUsage()).toMatchObject({ commands: 123, wakes: 4 });
+    expect(api.getQuotaUsage()?.at).toBeTypeOf("number");
+  });
+
+  it("remembers counters from command responses, including envelope placement", async () => {
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true },
+        tesla_request_counter: { commands: "42", wakes: "5" }
+      }
+    });
+    await settle(api.sendCommand("honk"));
+    expect(api.getQuotaUsage()).toMatchObject({ commands: 42, wakes: 5 });
+  });
+
+  it("keeps the previous counters when a later response has malformed ones", async () => {
+    mockAxios
+      .mockResolvedValueOnce({
+        data: {
+          battery_level: 72,
+          tesla_request_counter: { commands: 10, wakes: 2 }
+        }
+      })
+      .mockResolvedValueOnce({
+        data: {
+          battery_level: 71,
+          tesla_request_counter: { commands: "many", wakes: null }
+        }
+      });
+    await settle(api.getCurrentData());
+    await settle(api.getCurrentData());
+    expect(api.getQuotaUsage()).toMatchObject({ commands: 10, wakes: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Monthly allowance exhaustion: terminal, actionable errors
+// ---------------------------------------------------------------------------
+
+describe("monthly allowance exhaustion", () => {
+  it("classifies an envelope wake-allowance error as terminal with an actionable message", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { result: false, reason: "Monthly wake limit exceeded" } }
+    });
+    const err = await settleRejects(api.sendCommand("charge_start"));
+    expect(err.message).toContain("NOT sent");
+    expect(err.message).toContain("Monthly wake limit exceeded");
+    expect(err.message).toMatch(/reset on the 1st of the month/);
+    expect(err.message).toMatch(/purchased from TeslaFi support/);
+    expect(mockAxios).toHaveBeenCalledTimes(1); // terminal: never retried
+  });
+
+  it("includes the last-known usage when available", async () => {
+    mockAxios
+      .mockResolvedValueOnce({
+        data: {
+          response: { result: true },
+          tesla_request_counter: { commands: 480, wakes: 50 }
+        }
+      })
+      .mockResolvedValueOnce({
+        data: {
+          response: {
+            result: false,
+            reason: "wake count exceeded for this month"
+          }
+        }
+      });
+    await settle(api.sendCommand("honk"));
+    const err = await settleRejects(api.sendCommand("honk"));
+    expect(err.message).toContain("480/500 commands");
+    expect(err.message).toContain("50/50 wakes");
+  });
+
+  it("classifies a plain-text allowance body from a command", async () => {
+    mockAxios.mockResolvedValue({
+      data: "You have exceeded your monthly command allowance"
+    });
+    const err = await settleRejects(api.sendCommand("honk"));
+    expect(err.message).toContain("NOT sent");
+    expect(err.message).toMatch(/1st of the month/);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("also classifies top-level error envelopes mentioning the allowance", async () => {
+    mockAxios.mockResolvedValue({
+      data: { error: "quota_exceeded", error_description: "wake quota used up" }
+    });
+    const err = await settleRejects(api.sendCommand("door_lock"));
+    expect(err.message).toContain("NOT sent");
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not misclassify ordinary command failures", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { result: false, reason: "This command is not enabled" } }
+    });
+    const err = await settleRejects(api.sendCommand("honk"));
+    expect(err.message).toBe("This command is not enabled");
+    expect(err.message).not.toContain("allowance");
+  });
+
+  it("does not misclassify auth errors", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { result: "unauthorized" } }
+    });
+    const err = await settleRejects(api.sendCommand("honk"));
+    expect(err.message).toMatch(/token is unauthorized/);
+    expect(err.message).not.toContain("allowance");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Permissive-match heuristics (undocumented TeslaFi payloads)
+// ---------------------------------------------------------------------------
+
+describe("isMonthlyAllowanceError heuristic", () => {
+  it.each([
+    ["Monthly wake limit exceeded"],
+    ["You have exceeded your monthly command allowance"],
+    ["wake count exceeded"],
+    ["command limit reached for this account"],
+    ["Quota exhausted"]
+  ])("matches allowance phrasing: %s", (text) => {
+    expect(isMonthlyAllowanceError(text)).toBe(true);
+  });
+
+  it.each([
+    ["Invalid TeslaFi API token. Please check your credentials."],
+    ["This command is not enabled"],
+    ["You are not logged in"],
+    ["bad request token=[redacted]"],
+    ["Rate limit exceeded, try again in 30 seconds"],
+    ["TeslaFi API request failed."],
+    [""]
+  ])("leaves ordinary errors alone: %s", (text) => {
+    expect(isMonthlyAllowanceError(text)).toBe(false);
+  });
+});
+
+describe("indicatesUnsentAsleep heuristic", () => {
+  it.each([
+    [{ response: { result: "unsent" } }],
+    [{ result: "unsent", reason: "vehicle asleep" }],
+    ["Vehicle is asleep - command not sent (noWake)"],
+    ["Command was not sent: car is sleeping"]
+  ])("matches unsent/asleep phrasing: %j", (value) => {
+    expect(indicatesUnsentAsleep(value)).toBe(true);
+  });
+
+  it.each([
+    [{ result: true, reason: "" }],
+    ["Sleep attempt started"],
+    ["Invalid TeslaFi API token. Please check your credentials."],
+    [{ state: "asleep" }], // asleep alone, no unsent indication
+    [""]
+  ])("does not match ordinary responses: %j", (value) => {
+    expect(indicatesUnsentAsleep(value)).toBe(false);
   });
 });
 
@@ -1011,6 +1502,61 @@ describe("service method happy paths", () => {
       settle(api.sendCommand("set_sentry_mode", { sentryMode: 1 }))
     ).resolves.toEqual({ result: true, reason: "" });
     expect(axiosConfig().params.sentryMode).toBe(1);
+  });
+
+  it("preserves a tesla_request_counter that sits on the response envelope", async () => {
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: true, reason: "" },
+        tesla_request_counter: { commands: 12, wakes: 3 }
+      }
+    });
+    await expect(settle(api.sendCommand("honk"))).resolves.toEqual({
+      result: true,
+      reason: "",
+      tesla_request_counter: { commands: 12, wakes: 3 }
+    });
+  });
+
+  it("never overwrites a tesla_request_counter already inside the response", async () => {
+    mockAxios.mockResolvedValue({
+      data: {
+        response: {
+          result: true,
+          tesla_request_counter: { commands: 7, wakes: 1 }
+        },
+        tesla_request_counter: { commands: 999, wakes: 999 }
+      }
+    });
+    const result = await settle(api.sendCommand("honk"));
+    expect(result.tesla_request_counter).toEqual({ commands: 7, wakes: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// command_count: officially a command, effectively read-only
+// ---------------------------------------------------------------------------
+
+describe("command_count", () => {
+  it("requests feed.php with command=command_count", async () => {
+    mockAxios.mockResolvedValue({
+      data: { tesla_request_counter: { commands: 42, wakes: 5 } }
+    });
+    const result = await settle(api.sendCommand("command_count"));
+    expect(result.tesla_request_counter).toEqual({ commands: 42, wakes: 5 });
+    expect(axiosConfig().params.command).toBe("command_count");
+  });
+
+  it("is retried like a read on mid-flight failures (it changes nothing)", async () => {
+    mockAxios
+      .mockRejectedValueOnce(netError("ECONNRESET"))
+      .mockResolvedValueOnce({
+        data: { tesla_request_counter: { commands: 42, wakes: 5 } }
+      });
+    await expect(settle(api.sendCommand("command_count"))).resolves.toEqual({
+      tesla_request_counter: { commands: 42, wakes: 5 }
+    });
+    expect(mockAxios).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "teslafi-mcp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MCP server for the TeslaFi API - live vehicle data, drive/charge history, commute analysis, and opt-in vehicle commands",
   "type": "module",
   "main": "dist/index.js",
