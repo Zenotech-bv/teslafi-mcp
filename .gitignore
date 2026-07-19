@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Packaged MCP extension bundles (attach to GitHub Releases instead)
+*.mcpb
+
+# Environment / secrets — never commit tokens
+.env
+.env.*
+
+# Local tool settings
+.claude/
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,68 @@
+# NOTE: leading "/" anchors to the bundle root so these do NOT match
+# same-named folders inside node_modules (e.g. node_modules/debug/src/).
+
+# Dev sources and tooling — not needed at runtime (dist/ is shipped instead)
+/src/
+/scripts/
+/tsconfig.json
+/*.mcpb
+
+# Test suite and config — never shipped in the bundle
+/tests/
+/vitest.config.ts
+
+# Source maps / type declarations for OUR build only (keep runtime .js)
+/dist/**/*.map
+/dist/**/*.d.ts
+
+# Build/test-only dependencies (runtime uses node dist/index.js only).
+# This is the complete dev-only dependency closure: typescript/tsx/esbuild
+# (build) plus the vitest/vite/rolldown test toolchain and its helpers.
+# Platform-specific binary packages use a trailing * to cover all variants.
+node_modules/typescript/
+node_modules/tsx/
+node_modules/esbuild/
+node_modules/@esbuild/
+node_modules/@types/
+node_modules/vitest/
+node_modules/@vitest/
+node_modules/vite/
+node_modules/rolldown/
+node_modules/@rolldown/
+node_modules/@oxc-project/
+node_modules/@standard-schema/
+node_modules/@jridgewell/
+node_modules/assertion-error/
+node_modules/chai/
+node_modules/convert-source-map/
+node_modules/detect-libc/
+node_modules/es-module-lexer/
+node_modules/estree-walker/
+node_modules/expect-type/
+node_modules/fdir/
+node_modules/lightningcss*/
+node_modules/magic-string/
+node_modules/nanoid/
+node_modules/obug/
+node_modules/pathe/
+node_modules/picocolors/
+node_modules/picomatch/
+node_modules/postcss/
+node_modules/siginfo/
+node_modules/source-map-js/
+node_modules/stackback/
+node_modules/std-env/
+node_modules/tinybench/
+node_modules/tinyexec/
+node_modules/tinyglobby/
+node_modules/tinyrainbow/
+node_modules/undici-types/
+node_modules/why-is-node-running/
+node_modules/.bin/
+
+# Repo/dev-only files
+/.claude/
+/.github/
+/.git/
+/.gitignore
+/CONTRIBUTING.md

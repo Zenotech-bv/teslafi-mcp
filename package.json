@@ -1,0 +1,46 @@
+{
+  "name": "teslafi-mcp",
+  "version": "2.1.0",
+  "description": "MCP server for the TeslaFi API - live vehicle data, drive/charge history, commute analysis, and opt-in vehicle commands",
+  "type": "module",
+  "main": "dist/index.js",
+  "license": "MIT",
+  "author": "Matt Stevens <matt@zenotech.be>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zenotech-bv/teslafi-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Zenotech-bv/teslafi-mcp/issues"
+  },
+  "homepage": "https://github.com/Zenotech-bv/teslafi-mcp#readme",
+  "keywords": [
+    "mcp",
+    "tesla",
+    "teslafi",
+    "model-context-protocol",
+    "claude"
+  ],
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "test": "vitest run",
+    "inspect": "node scripts/inspect-teslafi.mjs",
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.23.0",
+    "axios": "^1.7.9",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  }
+}

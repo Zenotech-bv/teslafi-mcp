@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.3",
+  "name": "teslafi-mcp",
+  "display_name": "TeslaFi",
+  "version": "2.1.0",
+  "description": "Query your TeslaFi vehicle data: live status, drive and charge history, home-to-work commute analysis, and opt-in vehicle commands.",
+  "long_description": "An MCP server for the TeslaFi API. Exposes live/last-known vehicle data (feed.php), stored drive and charge history (history.php), home-to-work commute analysis built on drive history, and vehicle control commands (disabled by default; opt-in). Requires a TeslaFi API token from https://teslafi.com/api.php.",
+  "author": {
+    "name": "Matt Stevens",
+    "email": "matt@zenotech.be"
+  },
+  "keywords": ["tesla", "teslafi", "vehicle", "trips", "commute", "charging"],
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "TESLA_API_TOKEN": "${user_config.api_token}",
+        "TESLAFI_ENABLE_COMMANDS": "${user_config.enable_commands}"
+      }
+    }
+  },
+  "user_config": {
+    "api_token": {
+      "type": "string",
+      "title": "TeslaFi API Token",
+      "description": "Your TeslaFi API token, generated at https://teslafi.com/api.php (Settings -> TeslaFi API).",
+      "sensitive": true,
+      "required": true
+    },
+    "enable_commands": {
+      "type": "boolean",
+      "title": "Enable vehicle commands",
+      "description": "Maps to TESLAFI_ENABLE_COMMANDS. When off (the default), the server is read-only and tesla_send_command returns an instructive error instead of contacting your car. When on, commands must ALSO be enabled per-command on the Commands tab at https://teslafi.com/api.php.",
+      "sensitive": false,
+      "default": false
+    }
+  },
+  "tools": [
+    { "name": "tesla_get_current_data", "description": "Live / last-known vehicle data (state, battery, range, charging, location)." },
+    { "name": "tesla_get_drives", "description": "Stored drive history, optionally filtered by date range." },
+    { "name": "tesla_get_charges", "description": "Stored charge sessions, optionally filtered by date range." },
+    { "name": "tesla_get_trips_for_month", "description": "All drives in a given calendar month, normalized." },
+    { "name": "tesla_analyze_home_work_trips", "description": "Count home-to-work and work-to-home commutes in a month." },
+    { "name": "tesla_get_locations", "description": "Unique named locations and visit counts from drive history." },
+    { "name": "tesla_send_command", "description": "Send a vehicle control command (disabled by default; requires opt-in)." }
+  ],
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}

@@ -1,0 +1,1040 @@
+/**
+ * Unit tests for the TeslaFi API client (src/services/tesla-api.ts).
+ *
+ * All HTTP is mocked at the axios module boundary - no test ever contacts the
+ * real teslafi.com. Fake timers drive the 1s request-spacing gate, retry
+ * backoff, and the history cache TTL so the suite stays fast.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import axios, { AxiosError } from "axios";
+import TeslaFIAPI, {
+  MAX_ANALYSIS_TRIPS,
+  monthToDateRange,
+  TESLAFI_COMMAND_NAMES,
+  TESLAFI_COMMAND_PARAMS
+} from "../src/services/tesla-api.js";
+
+vi.mock("axios", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("axios")>();
+  return { ...actual, default: vi.fn() };
+});
+
+const mockAxios = axios as unknown as ReturnType<typeof vi.fn>;
+
+const TOKEN = "SECRET-TOKEN-abc123";
+const FEED_URL = "https://www.teslafi.com/feed.php";
+const HISTORY_URL = "https://www.teslafi.com/history.php";
+
+/** Config object axios was called with on call #n (default: last call). */
+function axiosConfig(n = -1): Record<string, any> {
+  const call = mockAxios.mock.calls.at(n);
+  if (!call) throw new Error("axios was not called");
+  return call[0] as Record<string, any>;
+}
+
+/** AxiosError with no response (network-level failure). */
+function netError(code: string, message = `request failed: ${code}`): AxiosError {
+  return new AxiosError(message, code, {
+    url: `${FEED_URL}?token=${TOKEN}&command=lastGood`
+  } as any);
+}
+
+/** AxiosError with an HTTP response. config.url deliberately embeds the token. */
+function httpError(
+  status: number,
+  opts: { headers?: Record<string, string>; statusText?: string } = {}
+): AxiosError {
+  const config = { url: `${FEED_URL}?token=${TOKEN}&command=lastGood` } as any;
+  return new AxiosError(
+    `Request failed with status code ${status}`,
+    "ERR_BAD_RESPONSE",
+    config,
+    {},
+    {
+      status,
+      statusText: opts.statusText ?? "",
+      headers: opts.headers ?? {},
+      data: "",
+      config
+    } as any
+  );
+}
+
+/**
+ * Await a promise that is expected to reject, while draining fake timers
+ * (throttle spacing / retry backoff). Returns the rejection error.
+ */
+async function settleRejects(p: Promise<unknown>): Promise<Error> {
+  const guarded = p.then(
+    () => {
+      throw new Error("expected promise to reject, but it resolved");
+    },
+    (e: unknown) => e as Error
+  );
+  await vi.runAllTimersAsync();
+  return guarded;
+}
+
+/** Await a promise expected to resolve, while draining fake timers. */
+async function settle<T>(p: Promise<T>): Promise<T> {
+  await vi.runAllTimersAsync();
+  return p;
+}
+
+let api: TeslaFIAPI;
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  mockAxios.mockReset();
+  delete process.env.TESLAFI_CACHE_TTL_SECONDS;
+  api = new TeslaFIAPI(TOKEN);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  delete process.env.TESLAFI_CACHE_TTL_SECONDS;
+});
+
+// ---------------------------------------------------------------------------
+// Command allowlist + local validation (no network)
+// ---------------------------------------------------------------------------
+
+describe("command allowlist", () => {
+  it("exposes exactly the 18 allowlisted commands", () => {
+    expect(TESLAFI_COMMAND_NAMES).toHaveLength(18);
+    expect(new Set(TESLAFI_COMMAND_NAMES).size).toBe(18);
+    expect(Object.keys(TESLAFI_COMMAND_PARAMS)).toEqual(
+      TESLAFI_COMMAND_NAMES
+    );
+  });
+
+  it("rejects an unknown command locally, without a network call", async () => {
+    await expect(api.sendCommand("self_destruct")).rejects.toThrow(
+      /Unknown TeslaFi command "self_destruct"/
+    );
+    await expect(api.sendCommand("self_destruct")).rejects.toThrow(/wake_up/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it.each(["token", "command", "wake"])(
+    'rejects the reserved parameter key "%s" without a network call',
+    async (key) => {
+      await expect(
+        api.sendCommand("set_charge_limit", { [key]: "evil" })
+      ).rejects.toThrow(new RegExp(`Parameter "${key}" is reserved`));
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+
+  it('points the caller at wake_seconds when "wake" is supplied', async () => {
+    await expect(
+      api.sendCommand("wake_up", { wake: 30 })
+    ).rejects.toThrow(/Use wake_seconds instead/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("rejects a parameter that is valid for a different command", async () => {
+    await expect(
+      api.sendCommand("set_charge_limit", { charging_amps: 16 })
+    ).rejects.toThrow(
+      /Parameter "charging_amps" is not valid for command "set_charge_limit"/
+    );
+    await expect(
+      api.sendCommand("set_charge_limit", { charging_amps: 16 })
+    ).rejects.toThrow(/charge_limit_soc/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it("rejects parameters on commands that take none", async () => {
+    await expect(
+      api.sendCommand("wake_up", { statement: true })
+    ).rejects.toThrow(/takes no parameters/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+
+  it.each(["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"])(
+    'rejects the prototype-inherited name "%s" as an unknown command, without a network call',
+    async (name) => {
+      // A plain bracket lookup on the allowlist object would resolve these
+      // to inherited (truthy) values and forward them to TeslaFi; the
+      // own-property check must reject them like any other unknown command.
+      await expect(api.sendCommand(name)).rejects.toThrow(
+        /Unknown TeslaFi command/
+      );
+      expect(mockAxios).not.toHaveBeenCalled();
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Token handling (the spread-order fix)
+// ---------------------------------------------------------------------------
+
+describe("token handling", () => {
+  it("sends the constructor token and command in the query params", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("set_charge_limit", { charge_limit_soc: 80 }));
+
+    const cfg = axiosConfig();
+    expect(cfg.url).toBe(FEED_URL);
+    expect(cfg.method).toBe("GET");
+    expect(cfg.params.token).toBe(TOKEN);
+    expect(cfg.params.command).toBe("set_charge_limit");
+    expect(cfg.params.charge_limit_soc).toBe(80);
+  });
+
+  it("never lets extra params override token or command, even if the allowlist were bypassed", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    // Call the internal request builder directly, simulating a hypothetical
+    // allowlist bypass: the { ...extraParams, token } spread order must still
+    // guarantee the real token (and the command argument) win.
+    await settle(
+      (api as any).feedRequest("wake_up", {
+        token: "attacker-token",
+        command: "door_unlock"
+      })
+    );
+
+    const cfg = axiosConfig();
+    expect(cfg.params.token).toBe(TOKEN);
+    expect(cfg.params.command).toBe("wake_up");
+    expect(JSON.stringify(cfg.params)).not.toContain("attacker-token");
+  });
+
+  it("cannot inject a token through the public sendCommand params", async () => {
+    await expect(
+      api.sendCommand("wake_up", { token: "attacker-token" })
+    ).rejects.toThrow(/reserved/);
+    expect(mockAxios).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error hygiene: the token and request URL never leak
+// ---------------------------------------------------------------------------
+
+describe("error hygiene", () => {
+  it("HTTP 401 produces a clean credential error without token, URL, or the AxiosError", async () => {
+    mockAxios.mockRejectedValue(httpError(401));
+    const err = await settleRejects(api.getCurrentData());
+
+    expect(err.message).toBe(
+      "Invalid TeslaFi API token. Please check your credentials."
+    );
+    expect(err).not.toBeInstanceOf(AxiosError);
+    expect((err as any).config).toBeUndefined();
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.message).not.toContain("feed.php");
+  });
+
+  it("sanitizes token and full request URL out of unknown axios error messages", async () => {
+    // An unknown axios error code falls through to the raw-message branch;
+    // the message deliberately embeds the full request URL with the token.
+    const leaky = new AxiosError(
+      `something odd happened for ${FEED_URL}?token=${TOKEN}&command=lastGood during send`,
+      "ERR_FR_TOO_MANY_REDIRECTS",
+      { url: `${FEED_URL}?token=${TOKEN}` } as any
+    );
+    mockAxios.mockRejectedValue(leaky);
+    const err = await settleRejects(api.getCurrentData());
+
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.message).not.toContain("feed.php");
+    expect(err.message).not.toContain("token=SECRET");
+    expect(err.message).toContain("[request URL redacted]");
+    expect(err).not.toBeInstanceOf(AxiosError);
+    expect((err as any).config).toBeUndefined();
+  });
+
+  it("sanitizes the token out of non-axios error messages", async () => {
+    mockAxios.mockRejectedValue(
+      new Error(`weird failure while using ${TOKEN} internally`)
+    );
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.message).toContain("[redacted]");
+  });
+
+  it("sanitizes the token out of TeslaFi envelope failure reasons", async () => {
+    mockAxios.mockResolvedValue({
+      data: {
+        response: { result: false, reason: `bad request token=${TOKEN}` }
+      }
+    });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.message).toContain("token=[redacted]");
+  });
+
+  it("HTTP 403 explains the TeslaFi Commands tab", async () => {
+    mockAxios.mockRejectedValue(httpError(403));
+    const err = await settleRejects(api.sendCommand("door_lock"));
+    expect(err.message).toMatch(/Access denied/);
+    expect(err.message).toMatch(/Commands tab/);
+    expect(err.message).not.toContain(TOKEN);
+  });
+
+  it("HTTP 404 maps to an endpoint-not-found error", async () => {
+    mockAxios.mockRejectedValue(httpError(404));
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/endpoint not found/);
+    expect(err.message).not.toContain(TOKEN);
+  });
+
+  it("surfaces TeslaFi error envelopes", async () => {
+    mockAxios.mockResolvedValue({
+      data: { error: "invalid_token", error_description: "bad things" }
+    });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toBe("TeslaFi API error: invalid_token - bad things");
+  });
+
+  it("surfaces the unauthorized envelope with a clean message", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { result: "unauthorized" } }
+    });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/token is unauthorized/);
+    expect(err.message).not.toContain(TOKEN);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Malformed vs genuinely-empty responses
+// ---------------------------------------------------------------------------
+
+describe("history payload normalization (toRecordArray)", () => {
+  it("throws a descriptive error for an HTML page", async () => {
+    mockAxios.mockResolvedValue({
+      data: "<html><body>TeslaFi is down</body></html>"
+    });
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/HTML page instead of JSON drive history/);
+  });
+
+  it("throws a descriptive error for plain text", async () => {
+    mockAxios.mockResolvedValue({ data: "unexpected maintenance message" });
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/non-JSON response instead of drive history/);
+    expect(err.message).toMatch(/not an empty result/);
+  });
+
+  it("throws a descriptive error for a null body", async () => {
+    mockAxios.mockResolvedValue({ data: null });
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/empty or malformed response for drive history/);
+  });
+
+  it("throws for an object of non-record values", async () => {
+    mockAxios.mockResolvedValue({ data: { unexpected: "shape" } });
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/unexpected payload shape for drive history/);
+  });
+
+  it("names charge history in charge errors", async () => {
+    mockAxios.mockResolvedValue({ data: "<html></html>" });
+    const err = await settleRejects(api.getCharges());
+    expect(err.message).toMatch(/charge history/);
+  });
+
+  it("returns [] for a genuinely-empty { count: 0 } result", async () => {
+    mockAxios.mockResolvedValue({ data: { count: 0 } });
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+  });
+
+  it("returns [] for an empty array and an empty object", async () => {
+    mockAxios.mockResolvedValue({ data: [] });
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+
+    mockAxios.mockResolvedValue({ data: {} });
+    const other = new TeslaFIAPI(TOKEN); // separate instance: no shared cache
+    await expect(settle(other.getCharges())).resolves.toEqual([]);
+  });
+
+  it("unwraps { count, results } payloads", async () => {
+    const records = [{ id: "1" }, { id: "2" }];
+    mockAxios.mockResolvedValue({ data: { count: 2, results: records } });
+    await expect(settle(api.getDrives())).resolves.toEqual(records);
+  });
+
+  it("unwraps responses keyed by id", async () => {
+    mockAxios.mockResolvedValue({
+      data: { "101": { id: "101" }, "102": { id: "102" } }
+    });
+    await expect(settle(api.getDrives())).resolves.toEqual([
+      { id: "101" },
+      { id: "102" }
+    ]);
+  });
+});
+
+describe("getCurrentData payload validation", () => {
+  it("rejects a plain-string body with a descriptive error", async () => {
+    mockAxios.mockResolvedValue({ data: "You are not logged in" });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/plain text/);
+    expect(err.message).toMatch(/instead of a vehicle data object/);
+  });
+
+  it("rejects an array body", async () => {
+    mockAxios.mockResolvedValue({ data: [1, 2, 3] });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/unexpected payload/);
+  });
+
+  it("rejects a null body", async () => {
+    mockAxios.mockResolvedValue({ data: null });
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/unexpected payload/);
+  });
+
+  it("unwraps a { response: {...} } envelope", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { battery_level: 55 } }
+    });
+    await expect(settle(api.getCurrentData())).resolves.toEqual({
+      battery_level: 55
+    });
+  });
+});
+
+describe("sendCommand payload validation", () => {
+  it("rejects a plain-text body instead of framing it as success", async () => {
+    mockAxios.mockResolvedValue({ data: "You are not logged in" });
+    const err = await settleRejects(api.sendCommand("wake_up"));
+    expect(err.message).toMatch(/plain text/);
+    expect(err.message).toMatch(/command "wake_up"/);
+    expect(err.message).toMatch(/may still have been executed/);
+  });
+
+  it("rejects an array body", async () => {
+    mockAxios.mockResolvedValue({ data: [1, 2, 3] });
+    const err = await settleRejects(api.sendCommand("honk"));
+    expect(err.message).toMatch(/unexpected payload/);
+  });
+
+  it("rejects a null body", async () => {
+    mockAxios.mockResolvedValue({ data: null });
+    const err = await settleRejects(api.sendCommand("door_lock"));
+    expect(err.message).toMatch(/unexpected payload/);
+    expect(err.message).toMatch(/may still have been executed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retry policy
+// ---------------------------------------------------------------------------
+
+describe("retry policy", () => {
+  it("retries a read after a transient network error, then succeeds", async () => {
+    mockAxios
+      .mockRejectedValueOnce(netError("ENOTFOUND"))
+      .mockResolvedValueOnce({ data: { count: 0 } });
+
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits at least the backoff before the read retry", async () => {
+    mockAxios
+      .mockRejectedValueOnce(netError("ENOTFOUND"))
+      .mockResolvedValueOnce({ data: { count: 0 } });
+
+    const p = api.getDrives();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    // Backoff for attempt 0 is 500ms + jitter; nothing may fire before 498ms.
+    await vi.advanceTimersByTimeAsync(497);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.runAllTimersAsync();
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await expect(p).resolves.toEqual([]);
+  });
+
+  it("gives up after 2 retries (3 attempts) for reads", async () => {
+    mockAxios.mockRejectedValue(netError("ENOTFOUND"));
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/Could not reach TeslaFi \(network error\)/);
+    expect(mockAxios).toHaveBeenCalledTimes(3);
+  });
+
+  it("also retries reads on 5xx and mid-flight resets", async () => {
+    mockAxios
+      .mockRejectedValueOnce(httpError(503))
+      .mockRejectedValueOnce(netError("ECONNRESET"))
+      .mockResolvedValueOnce({ data: { count: 0 } });
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+    expect(mockAxios).toHaveBeenCalledTimes(3);
+  });
+
+  it("does NOT retry a command on ECONNRESET (may already have executed)", async () => {
+    mockAxios.mockRejectedValue(netError("ECONNRESET"));
+    const err = await settleRejects(api.sendCommand("door_unlock"));
+    expect(err.message).toMatch(/Could not reach TeslaFi/);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT retry a command on a 5xx response", async () => {
+    mockAxios.mockRejectedValue(
+      httpError(503, { statusText: "Service Unavailable" })
+    );
+    const err = await settleRejects(api.sendCommand("charge_start"));
+    expect(err.message).toBe(
+      "TeslaFi API error: HTTP 503 Service Unavailable"
+    );
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a command on a pre-connection DNS failure (not yet sent)", async () => {
+    mockAxios
+      .mockRejectedValueOnce(netError("ENOTFOUND"))
+      .mockResolvedValueOnce({ data: { response: { result: true } } });
+    await expect(
+      settle(api.sendCommand("door_lock"))
+    ).resolves.toEqual({ result: true });
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors Retry-After on 429 before retrying", async () => {
+    mockAxios
+      .mockRejectedValueOnce(
+        httpError(429, { headers: { "retry-after": "5" } })
+      )
+      .mockResolvedValueOnce({ data: { count: 0 } });
+
+    const p = api.getDrives();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4997); // t ~= 4998 < 5000
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10); // past the 5s Retry-After
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await expect(p).resolves.toEqual([]);
+  });
+
+  it("retries a command on 429 (rate limiter rejected it before execution)", async () => {
+    mockAxios
+      .mockRejectedValueOnce(
+        httpError(429, { headers: { "retry-after": "1" } })
+      )
+      .mockResolvedValueOnce({ data: { response: { result: true } } });
+    await expect(settle(api.sendCommand("honk"))).resolves.toEqual({
+      result: true
+    });
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a 429 whose Retry-After exceeds the 60s cap, and reports the wait", async () => {
+    mockAxios.mockRejectedValue(
+      httpError(429, { headers: { "retry-after": "120" } })
+    );
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/rate limit exceeded/);
+    expect(err.message).toMatch(/wait 120s/);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries a 429 at exactly the 60s cap", async () => {
+    mockAxios
+      .mockRejectedValueOnce(
+        httpError(429, { headers: { "retry-after": "60" } })
+      )
+      .mockResolvedValueOnce({ data: { count: 0 } });
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a 429 without Retry-After", async () => {
+    mockAxios.mockRejectedValue(httpError(429));
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/rate limit exceeded/);
+    expect(err.message).not.toMatch(/asked to wait/);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Single-destination hardening: www.teslafi.com is the only destination, ever
+// (no redirects, no env-configured proxies)
+// ---------------------------------------------------------------------------
+
+describe("redirect and proxy hardening", () => {
+  it("sets maxRedirects: 0 and proxy: false on every feed.php request", async () => {
+    mockAxios.mockResolvedValue({ data: { battery_level: 72 } });
+    await settle(api.getCurrentData());
+    expect(axiosConfig().maxRedirects).toBe(0);
+    expect(axiosConfig().proxy).toBe(false);
+  });
+
+  it("sets maxRedirects: 0 and proxy: false on every history.php request", async () => {
+    mockAxios.mockResolvedValue({ data: { count: 0 } });
+    await settle(api.getDrives());
+    expect(axiosConfig().maxRedirects).toBe(0);
+    expect(axiosConfig().proxy).toBe(false);
+  });
+
+  it("sets maxRedirects: 0 and proxy: false on command requests", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("wake_up"));
+    expect(axiosConfig().maxRedirects).toBe(0);
+    expect(axiosConfig().proxy).toBe(false);
+  });
+
+  it("keeps proxy: false on retried requests", async () => {
+    mockAxios
+      .mockRejectedValueOnce(netError("ENOTFOUND"))
+      .mockResolvedValueOnce({ data: { count: 0 } });
+    await settle(api.getDrives());
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    expect(axiosConfig(0).proxy).toBe(false);
+    expect(axiosConfig(1).proxy).toBe(false);
+  });
+
+  it("surfaces a redirect response as a clean error, without retrying", async () => {
+    mockAxios.mockRejectedValue(
+      httpError(302, { statusText: "Found" })
+    );
+    const err = await settleRejects(api.getDrives());
+    expect(err.message).toMatch(/unexpected redirect \(HTTP 302\)/);
+    expect(err.message).toMatch(/never follows redirects/);
+    expect(err.message).not.toContain(TOKEN);
+    expect(err.message).not.toContain("feed.php");
+    expect(mockAxios).toHaveBeenCalledTimes(1); // 3xx is never retried
+  });
+
+  it("maps permanent redirects (301) the same way", async () => {
+    mockAxios.mockRejectedValue(httpError(301));
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/unexpected redirect \(HTTP 301\)/);
+    expect(err.message).not.toContain(TOKEN);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wake_seconds handling
+// ---------------------------------------------------------------------------
+
+describe("wake_seconds", () => {
+  it("scales the axios timeout and adds the wake param", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("wake_up", {}, 45));
+
+    const cfg = axiosConfig();
+    expect(cfg.timeout).toBe(30000 + 45 * 1000);
+    expect(cfg.params.wake).toBe(45);
+  });
+
+  it("uses the default timeout and no wake param without wake_seconds", async () => {
+    mockAxios.mockResolvedValue({ data: { response: { result: true } } });
+    await settle(api.sendCommand("wake_up"));
+
+    const cfg = axiosConfig();
+    expect(cfg.timeout).toBe(30000);
+    expect(cfg.params).not.toHaveProperty("wake");
+  });
+
+  it("reports the wake-extended timeout in command timeout errors", async () => {
+    mockAxios.mockRejectedValue(netError("ECONNABORTED"));
+    const err = await settleRejects(api.sendCommand("wake_up", {}, 45));
+    expect(err.message).toMatch(/timed out after 75s/);
+    expect(err.message).toMatch(/may still have been executed/);
+    expect(mockAxios).toHaveBeenCalledTimes(1); // mutating: no timeout retry
+  });
+
+  it("reports the default timeout for read timeouts, with retries", async () => {
+    mockAxios.mockRejectedValue(netError("ECONNABORTED"));
+    const err = await settleRejects(api.getCurrentData());
+    expect(err.message).toMatch(/timed out after 30s/);
+    expect(err.message).toMatch(/Please try again/);
+    expect(mockAxios).toHaveBeenCalledTimes(3); // reads retry timeouts
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request spacing gate
+// ---------------------------------------------------------------------------
+
+describe("request spacing", () => {
+  it("spaces outbound requests at least 1s apart", async () => {
+    mockAxios.mockResolvedValue({ data: { count: 0 } });
+    const p1 = api.getDrives({ dateFrom: "2026-01-01", dateTo: "2026-01-31" });
+    const p2 = api.getDrives({ dateFrom: "2026-02-01", dateTo: "2026-02-28" });
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(997); // t ~= 998ms
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10); // past 1000ms
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await Promise.all([p1, p2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// History TTL cache
+// ---------------------------------------------------------------------------
+
+describe("history cache", () => {
+  const range = { dateFrom: "2026-07-01", dateTo: "2026-07-31" };
+
+  it("serves a second identical query from cache within the TTL", async () => {
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+    const first = await settle(api.getDrives(range));
+    const second = await settle(api.getDrives(range));
+
+    expect(first).toEqual([{ id: "1" }]);
+    expect(second).toEqual([{ id: "1" }]);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("dedupes concurrent identical queries onto one in-flight request", async () => {
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+    const [a, b] = await settle(
+      Promise.all([api.getDrives(range), api.getDrives(range)])
+    );
+    expect(a).toEqual(b);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("expires entries after the default 60s TTL", async () => {
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+    await settle(api.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(59_000);
+    await settle(api.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(1); // still cached at 59s
+
+    await vi.advanceTimersByTimeAsync(2_000); // past 60s
+    await settle(api.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("respects TESLAFI_CACHE_TTL_SECONDS", async () => {
+    process.env.TESLAFI_CACHE_TTL_SECONDS = "300";
+    const longApi = new TeslaFIAPI(TOKEN);
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+
+    await settle(longApi.getDrives(range));
+    await vi.advanceTimersByTimeAsync(120_000); // > default 60s, < 300s
+    await settle(longApi.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(200_000); // past 300s
+    await settle(longApi.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([["empty", ""], ["whitespace-only", "   "]])(
+    "falls back to the default 60s TTL when TESLAFI_CACHE_TTL_SECONDS is %s (does NOT disable caching)",
+    async (_label, value) => {
+      process.env.TESLAFI_CACHE_TTL_SECONDS = value;
+      const defaulted = new TeslaFIAPI(TOKEN);
+      mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+
+      // Number("") === 0 must not sneak through as "cache disabled":
+      // a second identical query within the default TTL stays cached.
+      await settle(defaulted.getDrives(range));
+      await settle(defaulted.getDrives(range));
+      expect(mockAxios).toHaveBeenCalledTimes(1);
+
+      // And the default 60s expiry still applies.
+      await vi.advanceTimersByTimeAsync(61_000);
+      await settle(defaulted.getDrives(range));
+      expect(mockAxios).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it("falls back to the default TTL for non-numeric values", async () => {
+    process.env.TESLAFI_CACHE_TTL_SECONDS = "not-a-number";
+    const defaulted = new TeslaFIAPI(TOKEN);
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+
+    await settle(defaulted.getDrives(range));
+    await settle(defaulted.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("TESLAFI_CACHE_TTL_SECONDS=0 disables caching", async () => {
+    process.env.TESLAFI_CACHE_TTL_SECONDS = "0";
+    const uncached = new TeslaFIAPI(TOKEN);
+    mockAxios.mockResolvedValue({ data: [{ id: "1" }] });
+
+    await settle(uncached.getDrives(range));
+    await settle(uncached.getDrives(range));
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("misses the cache for a different date window", async () => {
+    mockAxios.mockResolvedValue({ data: [] });
+    await settle(api.getDrives(range));
+    await settle(api.getDrives({ dateFrom: "2026-06-01", dateTo: "2026-06-30" }));
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches drives and charges separately", async () => {
+    mockAxios.mockResolvedValue({ data: [] });
+    await settle(api.getDrives(range));
+    await settle(api.getCharges(range));
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    expect(axiosConfig(0).params.command).toBe("drives");
+    expect(axiosConfig(1).params.command).toBe("charges");
+  });
+
+  it("does not cache failures", async () => {
+    mockAxios
+      .mockRejectedValueOnce(httpError(404))
+      .mockResolvedValueOnce({ data: [{ id: "1" }] });
+
+    await settleRejects(api.getDrives(range));
+    await expect(settle(api.getDrives(range))).resolves.toEqual([{ id: "1" }]);
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+  });
+
+  it("prunes expired entries once the cache exceeds 50 keys", async () => {
+    process.env.TESLAFI_CACHE_TTL_SECONDS = "1";
+    const pruning = new TeslaFIAPI(TOKEN);
+    mockAxios.mockResolvedValue({ data: [] });
+
+    // 52 distinct keys; the 1s request spacing means each prior entry has
+    // expired (1s TTL) by the time the next lands. Insert #51 triggers the
+    // size>50 prune of everything expired.
+    for (let i = 0; i < 52; i++) {
+      await settle(pruning.getDrives({ dateFrom: `range-${i}` }));
+    }
+    expect(mockAxios).toHaveBeenCalledTimes(52);
+    expect((pruning as any).historyCache.size).toBeLessThanOrEqual(2);
+  });
+
+  it("caps live entries at 50 even when a long TTL keeps them all unexpired", async () => {
+    // With a day-long TTL nothing expires during the test, so the size cap —
+    // not TTL expiry — is what must keep the map bounded.
+    process.env.TESLAFI_CACHE_TTL_SECONDS = "86400";
+    const capped = new TeslaFIAPI(TOKEN);
+    mockAxios.mockResolvedValue({ data: [] });
+
+    for (let i = 0; i < 60; i++) {
+      await settle(capped.getDrives({ dateFrom: `range-${i}` }));
+    }
+    expect(mockAxios).toHaveBeenCalledTimes(60);
+    expect((capped as any).historyCache.size).toBeLessThanOrEqual(50);
+
+    // The oldest key was evicted: re-querying it hits the network again...
+    await settle(capped.getDrives({ dateFrom: "range-0" }));
+    expect(mockAxios).toHaveBeenCalledTimes(61);
+
+    // ...while the newest key is still served from the cache.
+    await settle(capped.getDrives({ dateFrom: "range-59" }));
+    expect(mockAxios).toHaveBeenCalledTimes(61);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Happy paths for every public service method
+// ---------------------------------------------------------------------------
+
+describe("service method happy paths", () => {
+  const DRIVE = {
+    id: "7",
+    date: "2026-07-05 06:30:00",
+    startingLocationName: "",
+    startingAddress: "Kerkstraat 1",
+    locationName: "Acme HQ",
+    kilometers: "25.4",
+    miles: "15.8",
+    dayDriveHours: "0",
+    dayDriveMinutes: "31"
+  };
+
+  it("getCurrentData('current') requests feed.php without a command param", async () => {
+    mockAxios.mockResolvedValue({ data: { battery_level: 72 } });
+    const data = await settle(api.getCurrentData());
+    expect(data).toEqual({ battery_level: 72 });
+
+    const cfg = axiosConfig();
+    expect(cfg.url).toBe(FEED_URL);
+    expect(cfg.params).not.toHaveProperty("command");
+    expect(cfg.params.token).toBe(TOKEN);
+  });
+
+  it("getLastGoodData uses command=lastGood", async () => {
+    mockAxios.mockResolvedValue({ data: { battery_level: 72 } });
+    await settle(api.getLastGoodData());
+    expect(axiosConfig().params.command).toBe("lastGood");
+  });
+
+  it("getLastGoodTempData uses command=lastGoodTemp", async () => {
+    mockAxios.mockResolvedValue({ data: { inside_temp: "21.0" } });
+    await settle(api.getLastGoodTempData());
+    expect(axiosConfig().params.command).toBe("lastGoodTemp");
+  });
+
+  it("getDrives passes the date range to history.php", async () => {
+    mockAxios.mockResolvedValue({ data: [DRIVE] });
+    const drives = await settle(
+      api.getDrives({ dateFrom: "2026-07-01", dateTo: "2026-07-31" })
+    );
+    expect(drives).toEqual([DRIVE]);
+
+    const cfg = axiosConfig();
+    expect(cfg.url).toBe(HISTORY_URL);
+    expect(cfg.params).toMatchObject({
+      command: "drives",
+      token: TOKEN,
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31"
+    });
+  });
+
+  it("getDrives omits date params when no range is given", async () => {
+    mockAxios.mockResolvedValue({ data: [] });
+    await settle(api.getDrives());
+    expect(axiosConfig().params).not.toHaveProperty("dateFrom");
+    expect(axiosConfig().params).not.toHaveProperty("dateTo");
+  });
+
+  it("getCharges requests command=charges", async () => {
+    const charge = { id: "9", date: "2026-07-03 22:00:00", locationName: "Home" };
+    mockAxios.mockResolvedValue({ data: [charge] });
+    const charges = await settle(api.getCharges());
+    expect(charges).toEqual([charge]);
+    expect(axiosConfig().params.command).toBe("charges");
+  });
+
+  it("getTripsForMonth normalizes drives (UTC dates, km preferred, duration)", async () => {
+    mockAxios.mockResolvedValue({ data: [DRIVE] });
+    const trips = await settle(api.getTripsForMonth(2026, 7));
+
+    expect(axiosConfig().params).toMatchObject({
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31"
+    });
+    expect(trips).toHaveLength(1);
+    expect(trips[0]).toEqual({
+      id: 7,
+      start_date: "2026-07-05T06:30:00.000Z",
+      end_date: "2026-07-05T07:01:00.000Z",
+      start_location: "Kerkstraat 1", // startingAddress fallback
+      end_location: "Acme HQ",
+      distance: 25.4,
+      distance_unit: "km",
+      duration_minutes: 31
+    });
+    expect(trips[0]).not.toHaveProperty("raw");
+  });
+
+  it("getTripsForMonth falls back to miles when kilometers are missing", async () => {
+    mockAxios.mockResolvedValue({
+      data: [{ ...DRIVE, kilometers: "", miles: "15.8" }]
+    });
+    const trips = await settle(api.getTripsForMonth(2026, 7));
+    expect(trips[0].distance).toBe(15.8);
+    expect(trips[0].distance_unit).toBe("mi");
+  });
+
+  it("getTripsForMonth embeds raw records only when include_raw is true", async () => {
+    mockAxios.mockResolvedValue({ data: [DRIVE] });
+    const withRaw = await settle(api.getTripsForMonth(2026, 7, true));
+    expect(withRaw[0].raw).toEqual(DRIVE);
+
+    const fresh = new TeslaFIAPI(TOKEN);
+    const withoutRaw = await settle(fresh.getTripsForMonth(2026, 7, false));
+    expect(withoutRaw[0]).not.toHaveProperty("raw");
+  });
+
+  it("analyzeHomeWorkTrips counts commutes with loose, case-insensitive matching", async () => {
+    mockAxios.mockResolvedValue({
+      data: [
+        { ...DRIVE, id: "1", startingLocationName: "My Home", locationName: "ACME HQ" },
+        { ...DRIVE, id: "2", startingLocationName: "Acme HQ", locationName: "Home" },
+        { ...DRIVE, id: "3", startingLocationName: "Home", locationName: "Supermarket" }
+      ]
+    });
+    const result = await settle(
+      api.analyzeHomeWorkTrips(2026, 7, "home", "acme hq")
+    );
+    expect(result.total_trips).toBe(3);
+    expect(result.home_to_work_trips).toBe(1);
+    expect(result.work_to_home_trips).toBe(1);
+    expect(result.other_trips).toBe(1);
+    expect(result.trips).toHaveLength(2);
+    expect(result.trips_truncated).toBe(false);
+  });
+
+  it("analyzeHomeWorkTrips caps the matched-trip list at 500 and flags truncation", async () => {
+    const drives = Array.from({ length: MAX_ANALYSIS_TRIPS + 2 }, (_, i) => ({
+      ...DRIVE,
+      id: String(i + 1),
+      startingLocationName: "Home",
+      locationName: "Acme HQ"
+    }));
+    mockAxios.mockResolvedValue({ data: drives });
+    const result = await settle(
+      api.analyzeHomeWorkTrips(2026, 7, "Home", "Acme HQ")
+    );
+
+    expect(MAX_ANALYSIS_TRIPS).toBe(500);
+    expect(result.total_trips).toBe(502);
+    expect(result.home_to_work_trips).toBe(502); // counts cover the full month
+    expect(result.trips).toHaveLength(500); // embedded list is capped
+    expect(result.trips_truncated).toBe(true);
+  });
+
+  it("getLocations aggregates named locations, skipping addresses and Unknown", async () => {
+    mockAxios.mockResolvedValue({
+      data: [
+        { ...DRIVE, startingLocationName: "Home", locationName: "Acme HQ" },
+        { ...DRIVE, startingLocationName: "Home", locationName: "" },
+        { ...DRIVE, startingLocationName: "Acme HQ", locationName: "Home" },
+        { ...DRIVE, startingLocationName: "unknown", locationName: "Home" }
+      ]
+    });
+    const locations = await settle(
+      api.getLocations({ dateFrom: "2026-07-01", dateTo: "2026-07-31" })
+    );
+
+    expect(axiosConfig().params).toMatchObject({
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31"
+    });
+    expect(locations).toEqual([
+      { name: "Home", visits: 4, as_start: 2, as_end: 2 },
+      { name: "Acme HQ", visits: 2, as_start: 1, as_end: 1 }
+    ]);
+  });
+
+  it("sendCommand returns the unwrapped TeslaFi response", async () => {
+    mockAxios.mockResolvedValue({
+      data: { response: { result: true, reason: "" } }
+    });
+    await expect(
+      settle(api.sendCommand("set_sentry_mode", { sentryMode: 1 }))
+    ).resolves.toEqual({ result: true, reason: "" });
+    expect(axiosConfig().params.sentryMode).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// monthToDateRange helper
+// ---------------------------------------------------------------------------
+
+describe("monthToDateRange", () => {
+  it("covers a 31-day month", () => {
+    expect(monthToDateRange(2026, 7)).toEqual({
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31"
+    });
+  });
+
+  it("handles leap and non-leap February", () => {
+    expect(monthToDateRange(2024, 2).dateTo).toBe("2024-02-29");
+    expect(monthToDateRange(2026, 2).dateTo).toBe("2026-02-28");
+  });
+
+  it("zero-pads single-digit months", () => {
+    expect(monthToDateRange(2026, 3)).toEqual({
+      dateFrom: "2026-03-01",
+      dateTo: "2026-03-31"
+    });
+  });
+});
