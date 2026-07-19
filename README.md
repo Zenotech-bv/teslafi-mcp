@@ -10,6 +10,48 @@ patterns — and, only if you explicitly opt in, send vehicle commands.
 Example: *"How many times did I drive from Home to Acme HQ last month, and what
 did charging cost me?"*
 
+## What can you ask?
+
+Once connected, your MCP client can answer questions like these — and combine
+the underlying data in ways no fixed dashboard can.
+
+**Live status**
+
+- "Is my car charging right now, and what's it set to stop at?"
+- "What's my battery level — is that enough for a 150 km round trip?"
+- "Where's my car parked, and is it locked?"
+- "How many kilometres has my car done?"
+- "Check my tyre pressures — anything low?"
+- "What software version is the car on, and is an update pending?"
+
+**Driving & charging history**
+
+- "List my drives from last weekend."
+- "How far did I drive in June, and what was my longest trip?"
+- "Show this month's charging sessions — how much energy did I add in total?"
+- "How often do I charge away from home?"
+
+**Commutes & places**
+
+- "How many times did I commute to the office last month?"
+- "What are my ten most-visited places this year?"
+- "Which weekdays did I work from home in June?"
+
+**Reports & analysis** (the client combines tools and does the math)
+
+- "Build me a mileage expense report for July: date, from, to, distance — as a
+  table I can paste into a spreadsheet."
+- "Compare my energy use this month against last month."
+- "Estimate my charging cost per kilometre, assuming €0.30/kWh at home and
+  €0.55/kWh supercharging."
+
+**Vehicle commands** (only with the explicit opt-in — see below)
+
+- "Warm the cabin to 21 °C."
+- "Set the charge limit to 90% for tomorrow's long trip."
+- "Flash the lights so I can find the car in this car park."
+- "Lock the car."
+
 ## Tools
 
 | Tool | Purpose |
