@@ -29,6 +29,11 @@ async function hit(label, url, params) {
     const res = await axios.get(url, {
       params,
       timeout: 30000,
+      // Same hardening as the real client (src/services/tesla-api.ts):
+      // never follow redirects (a 3xx could re-send the token-bearing URL
+      // elsewhere) and never route through HTTP(S)_PROXY env proxies.
+      maxRedirects: 0,
+      proxy: false,
       // Accept any status so we can see error bodies too.
       validateStatus: () => true,
       // Don't let axios auto-parse, so we see the raw text shape.

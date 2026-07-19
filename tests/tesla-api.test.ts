@@ -838,7 +838,7 @@ describe("service method happy paths", () => {
     id: "7",
     date: "2026-07-05 06:30:00",
     startingLocationName: "",
-    startingAddress: "Kerkstraat 1",
+    startingAddress: "1 Church St",
     locationName: "Acme HQ",
     kilometers: "25.4",
     miles: "15.8",
@@ -914,7 +914,7 @@ describe("service method happy paths", () => {
       id: 7,
       start_date: "2026-07-05T06:30:00.000Z",
       end_date: "2026-07-05T07:01:00.000Z",
-      start_location: "Kerkstraat 1", // startingAddress fallback
+      start_location: "1 Church St", // startingAddress fallback
       end_location: "Acme HQ",
       distance: 25.4,
       distance_unit: "km",

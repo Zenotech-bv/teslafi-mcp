@@ -60,6 +60,19 @@ node_modules/undici-types/
 node_modules/why-is-node-running/
 node_modules/.bin/
 
+# Toolchain caches (vitest/vite write run artifacts under node_modules/.vite/)
+node_modules/.vite/
+node_modules/.cache/
+
+# Platform/arch-conditional dev-toolchain deps that are absent on this
+# Windows machine but would install elsewhere (fsevents on macOS; the
+# wasm-fallback runtime set pulled in by the rolldown/oxc toolchain).
+node_modules/fsevents/
+node_modules/@emnapi/
+node_modules/@napi-rs/
+node_modules/@tybys/
+node_modules/tslib/
+
 # Repo/dev-only files
 /.claude/
 /.github/
