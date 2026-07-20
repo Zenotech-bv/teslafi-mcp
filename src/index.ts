@@ -14,6 +14,10 @@
  *   TESLAFI_ENABLE_COMMANDS                 - Optional. Set to "true" to enable
  *     the tesla_send_command tool. Off by default: the server is read-only
  *     out of the box.
+ *   TESLAFI_UNITS                           - Optional. "metric" or "imperial"
+ *     (case-insensitive) pins the default unit system for data-returning tools
+ *     when a call does not pass `units`. Any other value (including the default
+ *     "automatic") defers to the TeslaFi account's measure setting, then metric.
  *   TESLAFI_CACHE_TTL_SECONDS               - Optional. In-memory history cache
  *     TTL in seconds (default: 60). Memory only - nothing is written to disk.
  */
@@ -22,7 +26,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import TeslaFIAPI, {
   indicatesUnsentAsleep,
-  TeslaFiRecord
+  normalizeFeedData,
+  resolveUnits,
+  selectDriveUnitFields,
+  TeslaFiRecord,
+  Trip,
+  UnitSystem
 } from "./services/tesla-api.js";
 import {
   AnalyzeHomeWorkTripsSchema,
@@ -44,7 +53,7 @@ import {
 // Initialize MCP server
 const server = new McpServer({
   name: "teslafi-mcp",
-  version: "2.2.0"
+  version: "2.3.0"
 });
 
 let teslaAPI: TeslaFIAPI;
@@ -170,15 +179,139 @@ function firstNonEmpty(...values: unknown[]): unknown {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Units helpers (shared by the renderers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the effective unit system for a tool call: explicit `units` arg,
+ * then TESLAFI_UNITS, then the account measure remembered from the last feed
+ * response, then metric.
+ */
+function resolveToolUnits(explicit?: string): UnitSystem {
+  return resolveUnits(
+    explicit,
+    process.env.TESLAFI_UNITS,
+    teslaAPI.getAccountMeasure()
+  );
+}
+
+const DASH = "—";
+
+/** Format a plain (non-physical) field, or a dash when empty. */
+function fStr(obj: Record<string, unknown>, key: string): string {
+  const v = obj[key];
+  return v === undefined || v === null || v === "" ? DASH : String(v);
+}
+
+/** Format a single-unit physical field ("72 %", "18.6 kWh"), or a dash. */
+function fSingle(
+  obj: Record<string, unknown>,
+  key: string,
+  unit: string
+): string {
+  const v = obj[key];
+  return v === undefined || v === null ? DASH : `${v} ${unit}`;
+}
+
+/**
+ * Format a dual-system physical field from its unit-suffixed keys, honoring
+ * the applied system: one value for metric/imperial, both (joined by " / ")
+ * for "both". Absent values render as a dash — never a bare number.
+ */
+function fDual(
+  obj: Record<string, unknown>,
+  base: string,
+  units: UnitSystem,
+  metricSuffix: string,
+  metricUnit: string,
+  imperialSuffix: string,
+  imperialUnit: string
+): string {
+  const parts: string[] = [];
+  if (units !== "imperial") {
+    const v = obj[`${base}_${metricSuffix}`];
+    parts.push(v === undefined || v === null ? DASH : `${v} ${metricUnit}`);
+  }
+  if (units !== "metric") {
+    const v = obj[`${base}_${imperialSuffix}`];
+    parts.push(v === undefined || v === null ? DASH : `${v} ${imperialUnit}`);
+  }
+  return parts.join(" / ");
+}
+
+/** Distance markdown from an object carrying distance_km / distance_mi. */
+function distanceMd(obj: Record<string, unknown>, units: UnitSystem): string {
+  return fDual(obj, "distance", units, "km", "km", "mi", "mi");
+}
+
+/** Extract a YYYY-MM-DD prefix from a TeslaFi timestamp or ISO string. */
+function ymd(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const match = String(value).trim().match(/^\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : null;
+}
+
+interface DateRange {
+  earliest: string | null;
+  latest: string | null;
+}
+
+/**
+ * Compute the earliest/latest record date across the FULL fetched dataset
+ * (before any pagination slicing). No extra network call is made — this only
+ * scans records already fetched for the query.
+ */
+function computeDateRange(
+  records: TeslaFiRecord[],
+  getDate: (r: TeslaFiRecord) => unknown
+): DateRange {
+  let earliest: string | null = null;
+  let latest: string | null = null;
+  for (const record of records) {
+    const day = ymd(getDate(record));
+    if (!day) {
+      continue;
+    }
+    if (earliest === null || day < earliest) {
+      earliest = day;
+    }
+    if (latest === null || day > latest) {
+      latest = day;
+    }
+  }
+  return { earliest, latest };
+}
+
+/**
+ * A short, honest note so a client cannot mislabel a partial history fetch as
+ * a lifetime figure. `what` names the record kind; `excludes` is the quantity
+ * ("distance" / "energy") that predates the TeslaFi join date.
+ */
+function coverageNote(
+  what: string,
+  earliest: string | null,
+  excludes: string
+): string {
+  const e = earliest ?? "unknown";
+  return (
+    `TeslaFi history covers only ${what} since you joined TeslaFi ` +
+    `(earliest record here: ${e}). A 'lifetime' figure derived from these ` +
+    `records excludes any ${excludes} before that date.`
+  );
+}
+
 /** Compact summary of a raw TeslaFi drive record (mirrors the markdown view). */
-function summarizeDrive(d: TeslaFiRecord) {
+function summarizeDrive(d: TeslaFiRecord, units: UnitSystem) {
   return {
     id: d.id ?? null,
     date: firstNonEmpty(d.date, d.startDate),
     start_location: d.startingLocationName || d.startingAddress || "Unknown",
     end_location: d.locationName || d.address || "Unknown",
-    distance_km: firstNonEmpty(d.kilometers),
-    distance_mi: firstNonEmpty(d.miles)
+    // Per-system physical fields selected from TeslaFi's pre-existing fields.
+    ...selectDriveUnitFields(d, units)
   };
 }
 
@@ -188,12 +321,38 @@ function summarizeCharge(c: TeslaFiRecord) {
     id: c.id ?? null,
     date: firstNonEmpty(c.date, c.startDate),
     location: c.locationName || c.address || "Unknown",
+    // kWh is never converted between systems — only the unit label is fixed.
     energy_added_kwh: firstNonEmpty(
       c.totalEnergyAdded,
       c.energyAdded,
       c.chargerKWH
     )
   };
+}
+
+/**
+ * Present a normalized Trip for output in the chosen system: physical distance
+ * is emitted with explicit unit suffix(es), never as a bare number.
+ */
+function presentTrip(t: Trip, units: UnitSystem): Record<string, unknown> {
+  const o: Record<string, unknown> = {
+    id: t.id,
+    start_date: t.start_date,
+    end_date: t.end_date,
+    start_location: t.start_location,
+    end_location: t.end_location,
+    duration_minutes: t.duration_minutes
+  };
+  if (units !== "imperial") {
+    o.distance_km = t.distance_km ?? null;
+  }
+  if (units !== "metric") {
+    o.distance_mi = t.distance_mi ?? null;
+  }
+  if (t.raw !== undefined) {
+    o.raw = t.raw;
+  }
+  return o;
 }
 
 /**
@@ -213,10 +372,13 @@ Args:
   - month (number): Calendar month (1-12, e.g., 7 for July)
   - home_location (string): Name of home location as it appears in TeslaFi (e.g., "Home")
   - work_location (string): Name of work location (e.g., "Acme HQ")
+  - units (string): 'metric' | 'imperial' | 'both' for the distances (default: resolved
+    from TESLAFI_UNITS, then your account measure setting, else metric)
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
 
 Returns: total_trips, home_to_work_trips, work_to_home_trips, other_trips, and matching trips
-(the matched-trip list is capped at 500 entries).
+(the matched-trip list is capped at 500 entries). Trip distances carry explicit unit fields
+(distance_km / distance_mi).
 
 Example: "Analyze trips from Home to Acme HQ for July 2026"`,
     inputSchema: AnalyzeHomeWorkTripsSchema,
@@ -235,13 +397,18 @@ Example: "Analyze trips from Home to Acme HQ for July 2026"`,
         params.home_location,
         params.work_location
       );
+      const units = resolveToolUnits(params.units);
+      const trips = result.trips.map((t) => presentTrip(t, units));
+      const output = { ...result, units, trips };
 
       if (params.response_format === "json") {
-        return toolResult(JSON.stringify(result, null, 2), result);
+        return toolResult(JSON.stringify(output, null, 2), output);
       }
 
       const lines = [
         `# Trip Analysis: ${monthName(params.year, params.month)}`,
+        "",
+        `**Units**: ${units}`,
         "",
         `## Summary`,
         `- **Total Trips**: ${result.total_trips}`,
@@ -251,18 +418,20 @@ Example: "Analyze trips from Home to Acme HQ for July 2026"`,
         ""
       ];
 
-      if (result.trips.length > 0) {
-        lines.push(`## Commute Trips (${result.trips.length})`, "");
-        for (const trip of result.trips) {
+      if (trips.length > 0) {
+        lines.push(`## Commute Trips (${trips.length})`, "");
+        for (const trip of trips) {
           lines.push(`- **${trip.start_location}** → **${trip.end_location}**`);
-          lines.push(`  - Date: ${new Date(trip.start_date).toLocaleString()}`);
-          lines.push(`  - Distance: ${trip.distance.toFixed(1)} ${trip.distance_unit}`);
+          lines.push(
+            `  - Date: ${new Date(String(trip.start_date)).toLocaleString()}`
+          );
+          lines.push(`  - Distance: ${distanceMd(trip, units)}`);
           lines.push(`  - Duration: ${trip.duration_minutes} minutes`);
           lines.push("");
         }
         if (result.trips_truncated) {
           lines.push(
-            `*Matched-trip list truncated to the first ${result.trips.length} trips; ` +
+            `*Matched-trip list truncated to the first ${trips.length} trips; ` +
               `the summary counts above cover the full month.*`,
             ""
           );
@@ -273,7 +442,7 @@ Example: "Analyze trips from Home to Acme HQ for July 2026"`,
         );
       }
 
-      return toolResult(lines.join("\n"), result);
+      return toolResult(lines.join("\n"), output);
     } catch (error) {
       return errorResult(error);
     }
@@ -289,8 +458,8 @@ server.registerTool(
     title: "Get Trips for Month",
     description: `Retrieve all drives recorded in TeslaFi for a specific calendar month.
 
-Each trip includes start/end locations, distance, and duration. Raw TeslaFi records
-are only embedded when include_raw is true.
+Each trip includes start/end locations, distance (with explicit unit fields), and duration.
+Raw TeslaFi records are only embedded when include_raw is true.
 
 Args:
   - year (number): Calendar year (e.g., 2026)
@@ -298,7 +467,12 @@ Args:
   - limit (number): Max trips to return (1-500, default: 50)
   - offset (number): Skip first N trips for pagination (default: 0)
   - include_raw (boolean): Embed raw TeslaFi records (default: false)
+  - units (string): 'metric' | 'imperial' | 'both' (default: resolved from TESLAFI_UNITS,
+    then your account measure setting, else metric)
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
+
+Also returns date_range and coverage_note describing which dates the fetched records
+actually span, so a partial fetch is never mislabeled as "lifetime".
 
 Example: "Show me all trips from July 2026"`,
     inputSchema: GetTripsForMonthSchema,
@@ -316,7 +490,11 @@ Example: "Show me all trips from July 2026"`,
         params.month,
         params.include_raw
       );
-      const paginated = trips.slice(params.offset, params.offset + params.limit);
+      const units = resolveToolUnits(params.units);
+      const dateRange = computeDateRange(trips, (t) => t.start_date);
+      const paginated = trips
+        .slice(params.offset, params.offset + params.limit)
+        .map((t) => presentTrip(t, units));
 
       const output = {
         year: params.year,
@@ -330,6 +508,9 @@ Example: "Show me all trips from July 2026"`,
           trips.length > params.offset + params.limit
             ? params.offset + params.limit
             : undefined,
+        units,
+        date_range: dateRange,
+        coverage_note: coverageNote("drives", dateRange.earliest, "distance"),
         trips: paginated
       };
 
@@ -337,10 +518,16 @@ Example: "Show me all trips from July 2026"`,
         return toolResult(JSON.stringify(output, null, 2), output);
       }
 
+      const from = output.returned_trips > 0 ? params.offset + 1 : 0;
+      const to = params.offset + output.returned_trips;
+      const since = dateRange.earliest ? ` (since ${dateRange.earliest})` : "";
       const lines = [
         `# Trips: ${monthName(params.year, params.month)}`,
         "",
-        `**Total**: ${output.total_trips} | **Showing**: ${output.returned_trips}`,
+        `**${output.total_trips.toLocaleString("en-US")} trips on record${since}**; showing ${from}–${to}`,
+        `**Units**: ${units}`,
+        "",
+        `*${output.coverage_note}*`,
         ""
       ];
 
@@ -351,8 +538,10 @@ Example: "Show me all trips from July 2026"`,
           lines.push(`## Trip ${trip.id}`);
           lines.push(`- **From**: ${trip.start_location}`);
           lines.push(`- **To**: ${trip.end_location}`);
-          lines.push(`- **Date**: ${new Date(trip.start_date).toLocaleString()}`);
-          lines.push(`- **Distance**: ${trip.distance.toFixed(1)} ${trip.distance_unit}`);
+          lines.push(
+            `- **Date**: ${new Date(String(trip.start_date)).toLocaleString()}`
+          );
+          lines.push(`- **Distance**: ${distanceMd(trip, units)}`);
           lines.push(`- **Duration**: ${trip.duration_minutes} minutes`);
           lines.push("");
         }
@@ -386,6 +575,8 @@ Use these names with tesla_analyze_home_work_trips.
 Args:
   - date_from (string, optional): Only include drives on/after this date (YYYY-MM-DD)
   - date_to (string, optional): Only include drives on/before this date (YYYY-MM-DD)
+  - units (string): 'metric' | 'imperial' | 'both'. Accepted for consistency and echoed
+    in the response; visit counts are unitless, so it does not change the numbers.
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
 
 Example: "What locations does my car track?"`,
@@ -403,14 +594,15 @@ Example: "What locations does my car track?"`,
         dateFrom: params.date_from,
         dateTo: params.date_to
       });
+      const units = resolveToolUnits(params.units);
 
-      const output = { count: locations.length, locations };
+      const output = { count: locations.length, units, locations };
 
       if (params.response_format === "json") {
         return toolResult(JSON.stringify(output, null, 2), output);
       }
 
-      const lines = ["# Known Locations", ""];
+      const lines = ["# Known Locations", "", `**Units**: ${units}`, ""];
       if (locations.length === 0) {
         lines.push("No named locations found in drive history for this range.");
       } else {
@@ -437,12 +629,17 @@ server.registerTool(
     title: "Get Current Vehicle Data",
     description: `Get live or last-known vehicle data from TeslaFi (feed.php).
 
-Returns state, battery, range, charging, climate, and location fields.
+Returns state, battery, range, charging, climate, and location fields. Physical quantities
+carry explicit unit-suffixed field names (e.g. odometer_km / odometer_mi, inside_temp_c /
+inside_temp_f, tpms_front_left_bar / tpms_front_left_psi). Live-feed numbers are Tesla-native
+and are converted here to the chosen system.
 
 Args:
   - source (string): 'current' (latest, may be sparse while the car sleeps),
     'lastGood' (last point with full charge data), or 'lastGoodTemp' (last point with temperatures).
     Default: 'current'.
+  - units (string): 'metric' | 'imperial' | 'both' (default: resolved from TESLAFI_UNITS,
+    then your account measure setting, else metric)
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
 
 Example: "What's my car's battery level right now?"`,
@@ -457,41 +654,85 @@ Example: "What's my car's battery level right now?"`,
   async (params: GetCurrentDataInput) => {
     try {
       const data = await teslaAPI.getCurrentData(params.source);
+      // Resolve AFTER the fetch so this call's own account measure is available.
+      const units = resolveToolUnits(params.units);
+      const out = normalizeFeedData(data, units);
 
       if (params.response_format === "json") {
-        return toolResult(JSON.stringify(data, null, 2), data);
+        return toolResult(JSON.stringify(out, null, 2), out);
       }
-
-      const pick = (key: string) =>
-        data[key] === undefined || data[key] === null || data[key] === ""
-          ? "—"
-          : String(data[key]);
 
       const lines = [
         `# Vehicle Data (${params.source})`,
         "",
-        `- **Name**: ${pick("display_name")}`,
-        `- **State**: ${pick("state")} / ${pick("carState")}`,
-        `- **Battery**: ${pick("battery_level")}% (usable ${pick("usable_battery_level")}%)`,
-        `- **Est. range**: ${pick("est_battery_range")}`,
-        `- **Charging**: ${pick("charging_state")} — added ${pick("charge_energy_added")} kWh @ ${pick("charger_power")} kW`,
-        `- **Charge limit**: ${pick("charge_limit_soc")}%`,
-        `- **Odometer**: ${pick("odometer")}`,
-        `- **Location**: ${pick("location")} (${pick("latitude")}, ${pick("longitude")})`,
-        `- **Speed**: ${pick("speed")} | **Shift**: ${pick("shift_state")}`,
-        `- **Inside/Outside temp**: ${pick("inside_temp")} / ${pick("outside_temp")}`,
-        `- **Locked**: ${pick("locked")} | **Sentry**: ${pick("sentry_mode")}`,
-        `- **Data timestamp**: ${pick("Date")}`
+        `**Units**: ${units}`,
+        "",
+        `- **Name**: ${fStr(out, "display_name")}`,
+        `- **State**: ${fStr(out, "state")} / ${fStr(out, "carState")}`,
+        `- **Battery**: ${fSingle(out, "battery_level_pct", "%")} (usable ${fSingle(
+          out,
+          "usable_battery_level_pct",
+          "%"
+        )})`,
+        `- **Est. range**: ${fDual(out, "est_battery_range", units, "km", "km", "mi", "mi")}`,
+        `- **Charging**: ${fStr(out, "charging_state")} — added ${fSingle(
+          out,
+          "charge_energy_added_kwh",
+          "kWh"
+        )} @ ${fSingle(out, "charger_power_kw", "kW")}`,
+        `- **Charge limit**: ${fSingle(out, "charge_limit_soc_pct", "%")}`,
+        `- **Odometer**: ${fDual(out, "odometer", units, "km", "km", "mi", "mi")}`,
+        `- **Location**: ${fStr(out, "location")} (${fStr(out, "latitude")}, ${fStr(
+          out,
+          "longitude"
+        )})`,
+        `- **Speed**: ${fDual(out, "speed", units, "kmh", "km/h", "mph", "mph")} | **Shift**: ${fStr(
+          out,
+          "shift_state"
+        )}`,
+        `- **Inside/Outside temp**: ${fDual(
+          out,
+          "inside_temp",
+          units,
+          "c",
+          "°C",
+          "f",
+          "°F"
+        )} / ${fDual(out, "outside_temp", units, "c", "°C", "f", "°F")}`
       ];
 
+      // Tyre pressures are only surfaced when the feed carried at least one.
+      const tpmsBases = [
+        ["tpms_front_left", "FL"],
+        ["tpms_front_right", "FR"],
+        ["tpms_rear_left", "RL"],
+        ["tpms_rear_right", "RR"]
+      ] as const;
+      const hasTpms = tpmsBases.some(
+        ([base]) =>
+          out[`${base}_bar`] != null || out[`${base}_psi`] != null
+      );
+      if (hasTpms) {
+        const parts = tpmsBases.map(
+          ([base, label]) =>
+            `${label} ${fDual(out, base, units, "bar", "bar", "psi", "psi")}`
+        );
+        lines.push(`- **Tyre pressures**: ${parts.join(" | ")}`);
+      }
+
+      lines.push(
+        `- **Locked**: ${fStr(out, "locked")} | **Sentry**: ${fStr(out, "sentry_mode")}`,
+        `- **Data timestamp**: ${fStr(out, "Date")}`
+      );
+
       // Surface TeslaFi's monthly quota counter when the response embeds it
-      // (it is part of `data`, so structured output carries it too).
-      const quota = quotaLine(data);
+      // (it is part of `out`, so structured output carries it too).
+      const quota = quotaLine(out);
       if (quota) {
         lines.push("", quota);
       }
 
-      return toolResult(lines.join("\n"), data);
+      return toolResult(lines.join("\n"), out);
     } catch (error) {
       return errorResult(error);
     }
@@ -507,8 +748,9 @@ server.registerTool(
     title: "Get Drives",
     description: `Retrieve stored drive history from TeslaFi (history.php).
 
-Returns compact drive summaries. Raw TeslaFi records are only embedded when
-include_raw is true. Optionally filter by date range.
+Returns compact drive summaries with explicit unit-suffixed fields (distance_km/distance_mi,
+efficiency_wh_km/efficiency_wh_mi, speed_avg_kmh/speed_avg_mph, speed_max_*). Raw TeslaFi
+records are only embedded when include_raw is true. Optionally filter by date range.
 
 Args:
   - date_from (string, optional): Start date (YYYY-MM-DD)
@@ -516,7 +758,12 @@ Args:
   - limit (number): Max drives to return (1-500, default: 50)
   - offset (number): Skip first N for pagination (default: 0)
   - include_raw (boolean): Embed raw TeslaFi records (default: false)
+  - units (string): 'metric' | 'imperial' | 'both' (default: resolved from TESLAFI_UNITS,
+    then your account measure setting, else metric)
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
+
+Also returns date_range and coverage_note: TeslaFi history only goes back to your join
+date, so a "lifetime" total from these records excludes any distance before then.
 
 Example: "Show my drives between 2026-07-01 and 2026-07-07"`,
     inputSchema: GetDrivesSchema,
@@ -533,12 +780,18 @@ Example: "Show my drives between 2026-07-01 and 2026-07-07"`,
         dateFrom: params.date_from,
         dateTo: params.date_to
       });
+      const units = resolveToolUnits(params.units);
+      const dateRange = computeDateRange(drives, (d) =>
+        firstNonEmpty(d.date, d.startDate)
+      );
       const paginated = drives.slice(
         params.offset,
         params.offset + params.limit
       );
       const items = paginated.map((d) =>
-        params.include_raw ? { ...summarizeDrive(d), raw: d } : summarizeDrive(d)
+        params.include_raw
+          ? { ...summarizeDrive(d, units), raw: d }
+          : summarizeDrive(d, units)
       );
 
       const output = {
@@ -547,6 +800,9 @@ Example: "Show my drives between 2026-07-01 and 2026-07-07"`,
         offset: params.offset,
         limit: params.limit,
         has_more: drives.length > params.offset + params.limit,
+        units,
+        date_range: dateRange,
+        coverage_note: coverageNote("drives", dateRange.earliest, "distance"),
         drives: items
       };
 
@@ -554,26 +810,28 @@ Example: "Show my drives between 2026-07-01 and 2026-07-07"`,
         return toolResult(JSON.stringify(output, null, 2), output);
       }
 
+      const from = output.returned > 0 ? params.offset + 1 : 0;
+      const to = params.offset + output.returned;
+      const since = dateRange.earliest ? ` (since ${dateRange.earliest})` : "";
       const lines = [
         `# Drives`,
         "",
-        `**Total**: ${output.total} | **Showing**: ${output.returned}`,
+        `**${output.total.toLocaleString("en-US")} drives on record${since}**; showing ${from}–${to}`,
+        `**Units**: ${units}`,
+        "",
+        `*${output.coverage_note}*`,
         ""
       ];
       if (paginated.length === 0) {
         lines.push("No drives found for this range.");
       } else {
-        for (const d of paginated) {
-          const start = d.startingLocationName || d.startingAddress || "Unknown";
-          const end = d.locationName || d.address || "Unknown";
-          const date = firstNonEmpty(d.date, d.startDate) ?? "";
-          // Apply the empty-string convention: kilometers "" must fall
-          // through to miles (a miles-unit account sends "" for kilometers).
-          const km = firstNonEmpty(d.kilometers);
-          const mi = firstNonEmpty(d.miles);
-          const dist =
-            km != null ? `${km} km` : mi != null ? `${mi} mi` : "—";
-          lines.push(`- **${start}** → **${end}** — ${dist} (${date})`);
+        for (const d of items) {
+          const start = d.start_location;
+          const end = d.end_location;
+          const date = d.date ?? "";
+          lines.push(
+            `- **${start}** → **${end}** — ${distanceMd(d, units)} (${date})`
+          );
         }
       }
       if (output.has_more) {
@@ -599,8 +857,8 @@ server.registerTool(
     title: "Get Charges",
     description: `Retrieve stored charge history from TeslaFi (history.php).
 
-Returns compact charge summaries. Raw TeslaFi records are only embedded when
-include_raw is true. Optionally filter by date range.
+Returns compact charge summaries (energy_added_kwh — kWh is never converted between systems).
+Raw TeslaFi records are only embedded when include_raw is true. Optionally filter by date range.
 
 Args:
   - date_from (string, optional): Start date (YYYY-MM-DD)
@@ -608,7 +866,12 @@ Args:
   - limit (number): Max charges to return (1-500, default: 50)
   - offset (number): Skip first N for pagination (default: 0)
   - include_raw (boolean): Embed raw TeslaFi records (default: false)
+  - units (string): 'metric' | 'imperial' | 'both'. Charge energy is in kWh in either system;
+    units is echoed in the response and applies to any raw distances you inspect.
   - response_format (string): 'markdown' or 'json' (default: 'markdown')
+
+Also returns date_range and coverage_note: TeslaFi history only goes back to your join
+date, so a "lifetime" total from these records excludes any energy before then.
 
 Example: "How much did I charge in July 2026?"`,
     inputSchema: GetChargesSchema,
@@ -625,6 +888,10 @@ Example: "How much did I charge in July 2026?"`,
         dateFrom: params.date_from,
         dateTo: params.date_to
       });
+      const units = resolveToolUnits(params.units);
+      const dateRange = computeDateRange(charges, (c) =>
+        firstNonEmpty(c.date, c.startDate)
+      );
       const paginated = charges.slice(
         params.offset,
         params.offset + params.limit
@@ -641,6 +908,13 @@ Example: "How much did I charge in July 2026?"`,
         offset: params.offset,
         limit: params.limit,
         has_more: charges.length > params.offset + params.limit,
+        units,
+        date_range: dateRange,
+        coverage_note: coverageNote(
+          "charge sessions",
+          dateRange.earliest,
+          "energy"
+        ),
         charges: items
       };
 
@@ -648,22 +922,28 @@ Example: "How much did I charge in July 2026?"`,
         return toolResult(JSON.stringify(output, null, 2), output);
       }
 
+      const from = output.returned > 0 ? params.offset + 1 : 0;
+      const to = params.offset + output.returned;
+      const since = dateRange.earliest ? ` (since ${dateRange.earliest})` : "";
       const lines = [
         `# Charges`,
         "",
-        `**Total**: ${output.total} | **Showing**: ${output.returned}`,
+        `**${output.total.toLocaleString("en-US")} charge sessions on record${since}**; showing ${from}–${to}`,
+        `**Units**: ${units}`,
+        "",
+        `*${output.coverage_note}*`,
         ""
       ];
       if (paginated.length === 0) {
         lines.push("No charges found for this range.");
       } else {
-        for (const c of paginated) {
-          const loc = c.locationName || c.address || "Unknown";
-          const date = firstNonEmpty(c.date, c.startDate) ?? "";
-          const added =
-            firstNonEmpty(c.totalEnergyAdded, c.energyAdded, c.chargerKWH) ??
-            "—";
-          lines.push(`- **${loc}** — +${added} kWh (${date})`);
+        for (const c of items) {
+          const loc = c.location;
+          const date = c.date ?? "";
+          const added = c.energy_added_kwh ?? null;
+          lines.push(
+            `- **${loc}** — ${added == null ? DASH : `+${added} kWh`} (${date})`
+          );
         }
       }
       if (output.has_more) {

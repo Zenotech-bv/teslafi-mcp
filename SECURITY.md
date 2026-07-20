@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| 2.2.x | Yes |
-| < 2.2 | No |
+| 2.3.x | Yes |
+| < 2.3 | No |
 
 Only the latest release receives security fixes. Please upgrade before
 reporting an issue against an older version.

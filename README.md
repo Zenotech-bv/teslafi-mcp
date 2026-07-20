@@ -19,17 +19,20 @@ the underlying data in ways no fixed dashboard can.
 
 - "Is my car charging right now, and what's it set to stop at?"
 - "What's my battery level — is that enough for a 150 km round trip?"
+- "What's my range — show it in miles instead."
 - "Where's my car parked, and is it locked?"
 - "How many kilometres has my car done?"
-- "Check my tyre pressures — anything low?"
+- "Check my tyre pressures (in bar) — anything low?"
 - "What software version is the car on, and is an update pending?"
 
 **Driving & charging history**
 
 - "List my drives from last weekend."
-- "How far did I drive in June, and what was my longest trip?"
+- "How far did I drive in June, and what was my longest trip? Use miles."
 - "Show this month's charging sessions — how much energy did I add in total?"
 - "How often do I charge away from home?"
+- "What's my total distance on record — and remember it only goes back to when
+  I joined TeslaFi, so don't call it lifetime."
 
 **Commutes & places**
 
@@ -68,20 +71,78 @@ the underlying data in ways no fixed dashboard can.
 | `tesla_get_locations` | Unique named locations and visit counts derived from drive history. |
 | `tesla_send_command` | Send a vehicle control command — **disabled by default**, see [Vehicle commands](#vehicle-commands-opt-in). Car commands **never wake a sleeping car** unless you pass `wake_seconds` or `no_wake: false`. |
 
+### Units
+
+Every data-returning tool (`tesla_get_current_data`, `tesla_get_drives`,
+`tesla_get_charges`, `tesla_get_trips_for_month`,
+`tesla_analyze_home_work_trips`, `tesla_get_locations`) accepts an optional
+`units` argument — `"metric"`, `"imperial"`, or `"both"` — and every response
+carries a top-level `units` field stating the system that was applied.
+
+**Physical quantities are self-describing.** Field names carry the unit as a
+suffix (`_km`/`_mi`, `_kmh`/`_mph`, `_c`/`_f`, `_bar`/`_psi`, `_kwh`, `_m`/`_ft`,
+`_pct`), and every markdown number is printed next to its unit (`314 km`,
+`24 °C`, `3.1 bar`, `18.6 kWh`, `72 %`). With `units: "both"` **both** suffixed
+fields are emitted for each quantity.
+
+**Effective-unit resolution** (used when `units` is not passed), in order:
+
+1. the explicit `units` tool argument;
+2. the `TESLAFI_UNITS` environment variable (`metric`/`imperial`,
+   case-insensitive; any other value ignored);
+3. your TeslaFi account preference (the feed's `measure` field), remembered in
+   memory from the most recent feed response this session;
+4. metric.
+
+> The OS locale is **not** visible to the server. `TESLAFI_UNITS` is the
+> documented way for a client to pin a default so you don't have to pass
+> `units` on every call.
+
+**Live feed vs. history.** Live feed values (`tesla_get_current_data`) are
+Tesla-native (miles, mph, °C, psi, metres) regardless of your account setting,
+so they are **converted** to the chosen system. History records
+(drives/charges/trips) already carry **both** unit systems, so the server
+**selects** the pre-existing field for the chosen system rather than
+re-converting — no double-conversion or rounding drift. Percentages, kWh, and
+currency are never converted; only their unit label is attached.
+
 ### Compact output and `include_raw`
 
 `tesla_get_drives`, `tesla_get_charges`, and `tesla_get_trips_for_month` return
-**compact records by default**:
+**compact records by default** (physical fields use the unit-suffixed names
+above, for the applied system):
 
-- Drives: `id`, `date`, `start_location`, `end_location`, `distance_km`, `distance_mi`
-- Charges: `id`, `date`, `location`, `energy_added_kwh`
-- Trips: a normalized shape with start/end location, ISO timestamps, distance,
-  and duration
+- Drives: `id`, `date`, `start_location`, `end_location`, then
+  `distance_km`/`distance_mi`, `efficiency_wh_km`/`efficiency_wh_mi`,
+  `speed_avg_kmh`/`speed_avg_mph`, `speed_max_kmh`/`speed_max_mph`,
+  `temperature_avg_c`/`temperature_avg_f` (°C-only source, converted for
+  imperial), `tpms_avg_bar`/`tpms_avg_psi` (bar-only source, converted for
+  imperial), and `drive_kwh` (kWh — never converted). Everything else stays in
+  the raw record (`include_raw`).
+- Charges: `id`, `date`, `location`, `energy_added_kwh` (kWh — never converted)
+- Trips: a normalized shape with start/end location, ISO timestamps,
+  `distance_km`/`distance_mi`, and duration in minutes
 
 All three tools accept an optional `include_raw` boolean (default `false`).
 Only when it is `true` is the full raw TeslaFi record embedded (under a `raw`
 key) alongside each summary — raw records are large, so request them only when
 you need fields the summaries don't carry.
+
+### History coverage metadata
+
+`tesla_get_drives`, `tesla_get_charges`, and `tesla_get_trips_for_month` also
+return, alongside `total`/`returned`/`offset`/`limit`/`has_more`:
+
+- `date_range`: `{ earliest, latest }` computed from the **full fetched
+  dataset** for the query (before pagination). When no date filter is supplied,
+  `earliest` is effectively your TeslaFi join date. No extra network call is
+  made — it is derived from the records already fetched.
+- `coverage_note`: a short sentence noting that TeslaFi history only goes back
+  to when you joined, so a "lifetime" figure derived from these records
+  excludes any distance/energy before that date.
+
+These let a client label totals honestly (the markdown likewise says, e.g.,
+`2,526 drives on record (since 2023-12-18); showing 1–50`).
 
 `tesla_analyze_home_work_trips` matches location names loosely
 (case-insensitive substring match) and caps the embedded matched-trip list at
@@ -141,6 +202,7 @@ All configuration is via environment variables:
 | `TESLA_API_TOKEN` | Yes* | — | Your TeslaFi API token. |
 | `TESLAFI_API_TOKEN` | Yes* | — | Alias for `TESLA_API_TOKEN`; either works. |
 | `TESLAFI_ENABLE_COMMANDS` | No | unset (off) | Enables the `tesla_send_command` tool. Only `true`, `1`, or `yes` (case-insensitive) enable it; **any other value keeps the server read-only**. |
+| `TESLAFI_UNITS` | No | unset (Automatic) | Default unit system for physical quantities when a tool call omits `units`. `metric` or `imperial` (case-insensitive) pins a default; **any other value** (including the extension's "Automatic") defers to your TeslaFi account's `measure` setting, then metric. The OS locale is **not** visible to the server, so this is the documented way for a client to pin a default without passing `units` on every call. |
 | `TESLAFI_CACHE_TTL_SECONDS` | No | `60` | TTL of the in-memory history cache, in seconds. Set to `0` to disable caching; invalid values fall back to the default. |
 
 \* One of the two token variables must be set; `TESLA_API_TOKEN` takes
@@ -149,7 +211,10 @@ precedence.
 Note for extension-bundle users: the "Enable vehicle commands" checkbox maps to
 `TESLAFI_ENABLE_COMMANDS`. When left off it passes the literal string `"false"`,
 which is not in the truthy set (`true`/`1`/`yes`) and therefore keeps commands
-disabled — only ticking the checkbox enables them.
+disabled — only ticking the checkbox enables them. The **Units** dropdown maps
+to `TESLAFI_UNITS`; its default "Automatic (account default)" passes a value
+the server ignores, so units fall back to your TeslaFi account setting (then
+metric) until you choose Metric or Imperial.
 
 ### Vehicle commands (opt-in)
 

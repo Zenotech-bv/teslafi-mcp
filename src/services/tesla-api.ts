@@ -182,6 +182,14 @@ export interface Trip {
   end_location: string;
   distance: number;
   distance_unit: "km" | "mi";
+  /**
+   * Distance in each system, SELECTED from the pre-existing TeslaFi fields
+   * (kilometers / miles) rather than re-converted, so the unit-aware renderers
+   * can present either system without double-conversion. null when TeslaFi did
+   * not record that system for the drive.
+   */
+  distance_km: number | null;
+  distance_mi: number | null;
   duration_minutes: number;
   /** The raw TeslaFi drive record; only included when explicitly requested. */
   raw?: TeslaFiRecord;
@@ -277,6 +285,12 @@ class TeslaFIAPI {
   private lastQuota: QuotaUsage | null = null;
   /** Last-known per-minute rate-limit state (in-memory only). */
   private lastRateLimit: RateLimitState | null = null;
+  /**
+   * Last-known account unit preference, taken from the `measure` field of the
+   * most recent feed response seen this session (in-memory only; never
+   * persisted). Feeds the tier-3 fallback in resolveUnits().
+   */
+  private lastMeasure: string | null = null;
 
   constructor(apiToken: string) {
     this.apiToken = apiToken;
@@ -327,6 +341,10 @@ class TeslaFIAPI {
           "rejected the request or is temporarily unavailable. Try again shortly."
       );
     }
+    // Remember the account unit preference for later unit resolution. Feed
+    // records carry a `measure` field ("metric" / "imperial"); history and
+    // command responses do not, so this is the one place it is recorded.
+    this.recordMeasure(data);
     return data;
   }
 
@@ -637,6 +655,30 @@ class TeslaFIAPI {
   }
 
   /**
+   * Last-known account unit preference (the feed `measure` field) seen this
+   * session, or null when no feed response has been observed yet. Used as the
+   * tier-3 fallback when resolving the effective unit system.
+   */
+  getAccountMeasure(): string | null {
+    return this.lastMeasure;
+  }
+
+  /**
+   * Remember the account unit preference from a feed record's `measure` field.
+   * In-memory only; never persisted. Absent or malformed values are ignored —
+   * this must never throw.
+   */
+  private recordMeasure(data: unknown): void {
+    if (data === null || typeof data !== "object" || Array.isArray(data)) {
+      return;
+    }
+    const measure = (data as Record<string, unknown>).measure;
+    if (typeof measure === "string" && measure.trim() !== "") {
+      this.lastMeasure = measure.trim();
+    }
+  }
+
+  /**
    * Update the last-known tesla_request_counter and rate_limit state from a
    * raw response body. TeslaFi embeds both either at the top level or beside
    * the { response: ... } envelope. Absent or malformed fields are ignored —
@@ -789,6 +831,9 @@ class TeslaFIAPI {
       end_location: getField(drive, ["locationName", "address"], "Unknown"),
       distance,
       distance_unit: useKm ? "km" : "mi",
+      // Selected, not re-converted: TeslaFi history records already carry both.
+      distance_km: Number.isFinite(km) ? km : null,
+      distance_mi: Number.isFinite(mi) ? mi : null,
       duration_minutes: Number.isFinite(durationMinutes) ? durationMinutes : 0
     };
     if (includeRaw) {
@@ -1418,6 +1463,279 @@ export function monthToDateRange(
     dateFrom: `${year}-${pad(month)}-01`,
     dateTo: `${year}-${pad(month)}-${pad(lastDay)}`
   };
+}
+
+// -----------------------------------------------------------------------------
+// Units: resolution, conversion, and unit-aware normalization
+// -----------------------------------------------------------------------------
+
+/** Exact unit-conversion constants. */
+export const MI_PER_KM = 1.609344;
+export const PSI_PER_BAR = 14.5037738;
+export const FT_PER_M = 3.280839895;
+
+/** The effective unit system applied to a response. */
+export type UnitSystem = "metric" | "imperial" | "both";
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+/** parseNum, but returns null (not NaN) for empty / non-numeric input. */
+function parseNumOrNull(value: unknown): number | null {
+  const n = parseNum(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Pure unit converters, rounded sensibly for display. */
+export function miToKm(mi: number): number {
+  return round1(mi * MI_PER_KM);
+}
+export function mphToKmh(mph: number): number {
+  return round1(mph * MI_PER_KM);
+}
+export function cToF(c: number): number {
+  return round1((c * 9) / 5 + 32);
+}
+export function psiToBar(psi: number): number {
+  return round2(psi / PSI_PER_BAR);
+}
+export function barToPsi(bar: number): number {
+  return round2(bar * PSI_PER_BAR);
+}
+export function mToFt(m: number): number {
+  return round1(m * FT_PER_M);
+}
+
+/**
+ * Resolve the effective unit system. Pure and fully testable given the three
+ * inputs; the class supplies `rememberedMeasure` from the last feed response.
+ *
+ * Order of precedence:
+ *   1. explicit tool argument ("metric" | "imperial" | "both")
+ *   2. TESLAFI_UNITS env var ("metric" | "imperial", case-insensitive; any
+ *      other value — e.g. "automatic", "" — is ignored)
+ *   3. account preference: the feed `measure` field ("metric" -> metric;
+ *      "imperial" or anything else non-metric -> imperial)
+ *   4. fallback: metric
+ *
+ * The OS locale is NOT visible to the server, so TESLAFI_UNITS (tier 2) is the
+ * documented way for a client to pin a default without passing `units` on
+ * every call.
+ */
+export function resolveUnits(
+  explicitArg?: string | null,
+  envValue?: string | null,
+  rememberedMeasure?: string | null
+): UnitSystem {
+  if (
+    explicitArg === "metric" ||
+    explicitArg === "imperial" ||
+    explicitArg === "both"
+  ) {
+    return explicitArg;
+  }
+  const env = typeof envValue === "string" ? envValue.trim().toLowerCase() : "";
+  if (env === "metric") {
+    return "metric";
+  }
+  if (env === "imperial") {
+    return "imperial";
+  }
+  if (rememberedMeasure != null && String(rememberedMeasure).trim() !== "") {
+    return String(rememberedMeasure).trim().toLowerCase() === "metric"
+      ? "metric"
+      : "imperial";
+  }
+  return "metric";
+}
+
+const wantsMetric = (u: UnitSystem): boolean => u === "metric" || u === "both";
+const wantsImperial = (u: UnitSystem): boolean =>
+  u === "imperial" || u === "both";
+
+/**
+ * Normalize a live feed.php record into unit-suffixed physical fields.
+ *
+ * IMPORTANT: live-feed numbers are Tesla-native and are NOT pre-converted by
+ * TeslaFi regardless of the account `measure` setting, so each physical field
+ * is CONVERTED here to the requested system(s). Non-physical fields pass
+ * through unchanged; a top-level `units` field records the applied system.
+ *
+ * Native units (per TeslaFi's feed): distances in miles, speed in mph,
+ * temperatures in Celsius (with *F variants provided for some), tyre pressures
+ * in psi, energy in kWh (never converted), battery percentages in % (never
+ * converted), elevation in metres.
+ */
+export function normalizeFeedData(
+  raw: TeslaFiRecord,
+  units: UnitSystem
+): TeslaFiRecord {
+  const out: TeslaFiRecord = {};
+  const consumed = new Set<string>();
+
+  const emitDistMi = (base: string, field: string): void => {
+    consumed.add(field);
+    const mi = parseNumOrNull(raw[field]);
+    if (wantsMetric(units)) out[`${base}_km`] = mi == null ? null : miToKm(mi);
+    if (wantsImperial(units)) out[`${base}_mi`] = mi == null ? null : round1(mi);
+  };
+  const emitSpeedMph = (base: string, field: string): void => {
+    consumed.add(field);
+    const mph = parseNumOrNull(raw[field]);
+    if (wantsMetric(units))
+      out[`${base}_kmh`] = mph == null ? null : mphToKmh(mph);
+    if (wantsImperial(units))
+      out[`${base}_mph`] = mph == null ? null : round1(mph);
+  };
+  const emitTempC = (
+    base: string,
+    cField: string,
+    fField: string | null
+  ): void => {
+    consumed.add(cField);
+    if (fField) consumed.add(fField);
+    const c = parseNumOrNull(raw[cField]);
+    if (wantsMetric(units)) out[`${base}_c`] = c == null ? null : round1(c);
+    if (wantsImperial(units)) {
+      // Prefer the provided *F field; else derive from Celsius.
+      let f = fField ? parseNumOrNull(raw[fField]) : null;
+      if (f == null && c != null) {
+        f = cToF(c);
+      } else if (f != null) {
+        f = round1(f);
+      }
+      out[`${base}_f`] = f;
+    }
+  };
+  const emitPsi = (base: string, field: string): void => {
+    consumed.add(field);
+    const psi = parseNumOrNull(raw[field]);
+    if (wantsMetric(units))
+      out[`${base}_bar`] = psi == null ? null : psiToBar(psi);
+    if (wantsImperial(units))
+      out[`${base}_psi`] = psi == null ? null : round1(psi);
+  };
+  const emitKwh = (base: string, field: string): void => {
+    consumed.add(field);
+    out[`${base}_kwh`] = parseNumOrNull(raw[field]);
+  };
+  const emitKw = (base: string, field: string): void => {
+    consumed.add(field);
+    out[`${base}_kw`] = parseNumOrNull(raw[field]);
+  };
+  const emitPct = (base: string, field: string): void => {
+    consumed.add(field);
+    out[`${base}_pct`] = parseNumOrNull(raw[field]);
+  };
+  const emitElevM = (base: string, field: string): void => {
+    consumed.add(field);
+    const m = parseNumOrNull(raw[field]);
+    if (wantsMetric(units)) out[`${base}_m`] = m == null ? null : round1(m);
+    if (wantsImperial(units)) out[`${base}_ft`] = m == null ? null : mToFt(m);
+  };
+
+  emitDistMi("odometer", "odometer");
+  emitDistMi("battery_range", "battery_range");
+  emitDistMi("ideal_battery_range", "ideal_battery_range");
+  emitDistMi("est_battery_range", "est_battery_range");
+  emitDistMi("maxRange", "maxRange");
+  emitDistMi("charge_added_rated", "charge_miles_added_rated");
+  emitDistMi("charge_added_ideal", "charge_miles_added_ideal");
+
+  emitSpeedMph("speed", "speed");
+  emitSpeedMph("charge_rate", "charge_rate");
+
+  emitTempC("inside_temp", "inside_temp", "inside_tempF");
+  emitTempC("outside_temp", "outside_temp", "outside_tempF");
+  emitTempC(
+    "driver_temp_setting",
+    "driver_temp_setting",
+    "driver_temp_settingF"
+  );
+  emitTempC("passenger_temp_setting", "passenger_temp_setting", null);
+
+  emitPsi("tpms_front_left", "tpms_front_left");
+  emitPsi("tpms_front_right", "tpms_front_right");
+  emitPsi("tpms_rear_left", "tpms_rear_left");
+  emitPsi("tpms_rear_right", "tpms_rear_right");
+
+  emitKwh("charge_energy_added", "charge_energy_added");
+  emitKwh("energy_remaining", "energy_remaining");
+  emitKwh("lifetime_energy_used", "lifetime_energy_used");
+  emitKw("charger_power", "charger_power");
+
+  emitPct("battery_level", "battery_level");
+  emitPct("usable_battery_level", "usable_battery_level");
+  emitPct("charge_limit_soc", "charge_limit_soc");
+
+  emitElevM("elevation", "elevation");
+
+  for (const [key, value] of Object.entries(raw)) {
+    if (!consumed.has(key)) {
+      out[key] = value;
+    }
+  }
+  out.units = units;
+  return out;
+}
+
+/**
+ * Build the per-system physical fields for a history drive record
+ * (history.php), unit-suffixed for the chosen system.
+ *
+ * Two kinds of source:
+ *   - Dual-source fields: TeslaFi already stores BOTH systems, so we SELECT the
+ *     pre-existing field (never re-convert) — avoids double conversion and
+ *     rounding drift.
+ *   - Single-source fields: temperatures exist only in °C and tyre pressures
+ *     only in bar, so imperial is CONVERTED (°C -> °F, bar -> psi).
+ *   - kWh is never converted; only its label is attached.
+ *
+ * Missing fields become null.
+ */
+export function selectDriveUnitFields(
+  d: TeslaFiRecord,
+  units: UnitSystem
+): TeslaFiRecord {
+  const out: TeslaFiRecord = {};
+  // Dual-source: select TeslaFi's own stored field for the chosen system.
+  const emitDual = (
+    base: string,
+    metricSuffix: string,
+    imperialSuffix: string,
+    metricField: string,
+    imperialField: string
+  ): void => {
+    if (wantsMetric(units))
+      out[`${base}_${metricSuffix}`] = parseNumOrNull(d[metricField]);
+    if (wantsImperial(units))
+      out[`${base}_${imperialSuffix}`] = parseNumOrNull(d[imperialField]);
+  };
+  // Single-source Celsius: convert to °F for imperial.
+  const emitFromCelsius = (base: string, field: string): void => {
+    const c = parseNumOrNull(d[field]);
+    if (wantsMetric(units)) out[`${base}_c`] = c == null ? null : round1(c);
+    if (wantsImperial(units)) out[`${base}_f`] = c == null ? null : cToF(c);
+  };
+  // Single-source bar: convert to psi for imperial.
+  const emitFromBar = (base: string, field: string): void => {
+    const bar = parseNumOrNull(d[field]);
+    if (wantsMetric(units)) out[`${base}_bar`] = bar == null ? null : round2(bar);
+    if (wantsImperial(units))
+      out[`${base}_psi`] = bar == null ? null : barToPsi(bar);
+  };
+
+  emitDual("distance", "km", "mi", "kilometers", "miles");
+  emitDual("efficiency", "wh_km", "wh_mi", "whKilo", "whMile");
+  emitDual("speed_avg", "kmh", "mph", "speedAVGK", "speedAVG");
+  emitDual("speed_max", "kmh", "mph", "speedMAXK", "speedMAX");
+  emitFromCelsius("temperature_avg", "temperatureAVG");
+  emitFromBar("tpms_avg", "tpmsAvg");
+  out.drive_kwh = parseNumOrNull(d.driveKwh); // kWh never converts
+  return out;
 }
 
 export default TeslaFIAPI;

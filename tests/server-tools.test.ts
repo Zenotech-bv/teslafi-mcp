@@ -11,6 +11,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import axios, { AxiosError } from "axios";
+import { readFileSync } from "node:fs";
 
 const captured = vi.hoisted(() => ({
   tools: new Map<
@@ -654,18 +655,64 @@ describe("quota usage warnings", () => {
 // ---------------------------------------------------------------------------
 
 describe("tesla_get_current_data", () => {
-  it("renders markdown by default and attaches the raw data as structured content", async () => {
+  it("renders markdown with explicit units and attaches normalized structured content", async () => {
     const result = await callTool("tesla_get_current_data");
     const md = text(result);
     expect(md).toContain("# Vehicle Data (current)");
     expect(md).toContain("**Name**: Test Car");
-    expect(md).toContain("**Battery**: 72% (usable 70%)");
-    expect(md).toContain("**Speed**: —"); // empty fields render as dashes
-    expect(result.structuredContent).toEqual(FEED_DATA);
+    // No account measure on FEED_DATA and TESLAFI_UNITS unset -> metric default.
+    expect(md).toContain("**Units**: metric");
+    // Percent fields carry an explicit unit token, with a space.
+    expect(md).toContain("**Battery**: 72 % (usable 70 %)");
+    expect(md).toContain("**Speed**: — |"); // empty fields render as dashes
+    // Temperature is Celsius-native; metric shows °C.
+    expect(md).toContain("21.5 °C");
+    // Structured content is normalized with unit-suffixed physical fields.
+    const out = result.structuredContent as any;
+    expect(out.units).toBe("metric");
+    expect(out.battery_level_pct).toBe(72);
+    expect(out.usable_battery_level_pct).toBe(70);
+    expect(out.charge_limit_soc_pct).toBe(80);
+    expect(out.inside_temp_c).toBe(21.5);
+    expect(out.outside_temp_c).toBe(18);
+    // Odometer is miles-native and converted to km for the metric system.
+    expect(out.odometer_km).toBeCloseTo(12345.6 * 1.609344, 1);
+    expect(out).not.toHaveProperty("odometer"); // no bare physical field
+    expect(out).not.toHaveProperty("odometer_mi"); // metric-only
+    // Non-physical fields pass through untouched.
+    expect(out.display_name).toBe("Test Car");
+    expect(out.state).toBe("online");
     // Default source sends no command param.
     expect((mockAxios.mock.calls[0][0] as any).params).not.toHaveProperty(
       "command"
     );
+  });
+
+  it("converts to imperial when units='imperial' is requested", async () => {
+    const result = await callTool("tesla_get_current_data", {
+      units: "imperial",
+      response_format: "json"
+    });
+    const out = JSON.parse(text(result));
+    expect(out.units).toBe("imperial");
+    // est_battery_range is miles-native: imperial keeps miles as-is.
+    expect(out.est_battery_range_mi).toBeCloseTo(301.4, 1);
+    expect(out).not.toHaveProperty("est_battery_range_km");
+    // Celsius-native temp -> °F via formula (no *F field in FEED_DATA).
+    expect(out.inside_temp_f).toBeCloseTo((21.5 * 9) / 5 + 32, 1);
+  });
+
+  it("emits both suffixed fields when units='both'", async () => {
+    const result = await callTool("tesla_get_current_data", {
+      units: "both",
+      response_format: "json"
+    });
+    const out = JSON.parse(text(result));
+    expect(out.units).toBe("both");
+    expect(out).toHaveProperty("odometer_km");
+    expect(out).toHaveProperty("odometer_mi");
+    expect(out).toHaveProperty("inside_temp_c");
+    expect(out).toHaveProperty("inside_temp_f");
   });
 
   it("passes source through to feed.php", async () => {
@@ -696,11 +743,14 @@ describe("tesla_get_current_data", () => {
     });
   });
 
-  it("returns JSON when requested", async () => {
+  it("returns normalized JSON when requested", async () => {
     const result = await callTool("tesla_get_current_data", {
       response_format: "json"
     });
-    expect(JSON.parse(text(result))).toEqual(FEED_DATA);
+    const out = JSON.parse(text(result));
+    expect(out.units).toBe("metric");
+    expect(out.battery_level_pct).toBe(72);
+    expect(out.display_name).toBe("Test Car");
   });
 
   it("turns service errors into a clean Error: text without the token", async () => {
@@ -732,14 +782,30 @@ describe("tesla_get_drives", () => {
     });
     const bareOut = bare.structuredContent;
     expect(bareOut.total).toBe(3);
+    // Metric by default (no account measure, TESLAFI_UNITS unset). Physical
+    // fields are selected from TeslaFi's own metric fields; absent ones (this
+    // fixture has no whKilo/speedAVGK/speedMAXK) become null.
     expect(bareOut.drives[0]).toEqual({
       id: "101",
       date: "2026-07-01 06:30:00",
       start_location: "Home",
       end_location: "Acme HQ",
-      distance_km: "25.4",
-      distance_mi: "15.8"
+      distance_km: 25.4,
+      efficiency_wh_km: null,
+      speed_avg_kmh: null,
+      speed_max_kmh: null,
+      temperature_avg_c: null,
+      tpms_avg_bar: null,
+      drive_kwh: null
     });
+    expect(bareOut.drives[0]).not.toHaveProperty("distance_mi"); // metric-only
+    expect(bareOut.units).toBe("metric");
+    expect(bareOut.date_range).toEqual({
+      earliest: "2026-07-01",
+      latest: "2026-07-02"
+    });
+    expect(bareOut.coverage_note).toMatch(/since you joined TeslaFi/);
+    expect(bareOut.coverage_note).toContain("2026-07-01");
     expect(bareOut.drives[0]).not.toHaveProperty("raw");
     // date: "" must not mask a populated startDate (empty-string convention).
     expect(bareOut.drives[2].date).toBe("2026-07-02 12:00:00");
@@ -782,7 +848,7 @@ describe("tesla_get_drives", () => {
     expect(md).toContain("**Home** → **Supermarket** — 3.2 km (2026-07-02 12:00:00)");
   });
 
-  it('applies the empty-string convention to distances (kilometers "" falls back to miles)', async () => {
+  it("selects the requested system per drive, treating an empty field as null (no double-convert)", async () => {
     // A miles-unit TeslaFi account returns kilometers: "" on every drive.
     mockAxios.mockImplementation(async (config: any) => {
       if (
@@ -811,18 +877,31 @@ describe("tesla_get_drives", () => {
     // Use a date window no other test touches: the module-level client keeps
     // a shared history cache, and a fresh key forces a real (mocked) request.
     const range = { date_from: "2026-09-01", date_to: "2026-09-02" };
-    const json = await callTool("tesla_get_drives", {
+
+    // Metric: kilometers is "" -> distance_km is null (never re-derived from miles).
+    const metric = await callTool("tesla_get_drives", {
       ...range,
+      units: "metric",
       response_format: "json"
     });
-    // "" must not surface as distance_km, and must not mask the miles value.
-    expect(json.structuredContent.drives[0].distance_km).toBeNull();
-    expect(json.structuredContent.drives[0].distance_mi).toBe("15.8");
+    expect(metric.structuredContent.drives[0].distance_km).toBeNull();
+    expect(metric.structuredContent.drives[0]).not.toHaveProperty("distance_mi");
 
-    const md = text(await callTool("tesla_get_drives", range));
+    // Imperial: the miles field is selected as-is (15.8), not converted.
+    const imperial = await callTool("tesla_get_drives", {
+      ...range,
+      units: "imperial",
+      response_format: "json"
+    });
+    expect(imperial.structuredContent.drives[0].distance_mi).toBe(15.8);
+    expect(imperial.structuredContent.drives[0]).not.toHaveProperty(
+      "distance_km"
+    );
+
+    const md = text(
+      await callTool("tesla_get_drives", { ...range, units: "imperial" })
+    );
     expect(md).toContain("**Home** → **Acme HQ** — 15.8 mi (2026-09-01 08:00:00)");
-    // Never an empty distance labeled km.
-    expect(md).not.toContain(" km");
   });
 });
 
@@ -885,14 +964,23 @@ describe("tesla_get_trips_for_month", () => {
     expect(out.total_trips).toBe(3);
     expect(out.returned_trips).toBe(3); // default limit 50
     expect(out.has_more).toBe(false);
+    expect(out.units).toBe("metric");
+    // The mock returns the July DRIVES fixture regardless of the requested
+    // month, so date_range reflects those record dates (computed from the full
+    // fetched set, before pagination).
+    expect(out.date_range).toEqual({
+      earliest: "2026-07-01",
+      latest: "2026-07-02"
+    });
+    expect(out.coverage_note).toMatch(/since you joined TeslaFi/);
     expect(out.trips[0]).toMatchObject({
       id: 101,
       start_location: "Home",
       end_location: "Acme HQ",
-      distance: 25.4,
-      distance_unit: "km",
+      distance_km: 25.4, // metric selected, unit-suffixed
       duration_minutes: 31
     });
+    expect(out.trips[0]).not.toHaveProperty("distance_mi"); // metric-only
     expect(out.trips[0]).not.toHaveProperty("raw"); // include_raw defaults false
     // The month is translated to a full calendar date range.
     expect(mockAxios).toHaveBeenCalledTimes(1);
@@ -987,5 +1075,181 @@ describe("tesla_get_locations", () => {
     const md = text(result);
     expect(md).toContain("# Known Locations");
     expect(md).toContain("**Home** — 3 visits (2 starts, 1 ends)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Units surfaced through the full tool path (markdown always shows a unit)
+// ---------------------------------------------------------------------------
+
+describe("units in tool output", () => {
+  it("current_data markdown states the applied system and labels every number", async () => {
+    const md = text(await callTool("tesla_get_current_data"));
+    expect(md).toContain("**Units**: metric");
+    expect(md).toMatch(/\d+ %/); // percent carries a space + unit
+    expect(md).toContain("°C"); // Celsius for metric
+    expect(md).toContain("km"); // odometer/range converted to km
+  });
+
+  it("drives markdown shows the applied system and the distance unit", async () => {
+    const md = text(
+      await callTool("tesla_get_drives", {
+        date_from: "2026-07-04",
+        date_to: "2026-07-05"
+      })
+    );
+    expect(md).toContain("**Units**: metric");
+    expect(md).toMatch(/— 25\.4 km/);
+  });
+
+  it("both-mode drives markdown shows km and mi together", async () => {
+    const md = text(
+      await callTool("tesla_get_drives", {
+        date_from: "2026-07-06",
+        date_to: "2026-07-07",
+        units: "both"
+      })
+    );
+    expect(md).toContain("**Units**: both");
+    expect(md).toContain("25.4 km / 15.8 mi");
+  });
+
+  it("charges markdown always labels energy in kWh", async () => {
+    const md = text(await callTool("tesla_get_charges", {}));
+    expect(md).toContain("**Units**:");
+    expect(md).toContain("+41.3 kWh");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// History coverage metadata (self-describing partial fetches)
+// ---------------------------------------------------------------------------
+
+describe("history coverage metadata", () => {
+  it("computes date_range from the FULL dataset even when paginated to one row", async () => {
+    const res = await callTool("tesla_get_drives", {
+      date_from: "2026-07-10",
+      date_to: "2026-07-11",
+      limit: 1,
+      offset: 0,
+      response_format: "json"
+    });
+    const out = res.structuredContent;
+    expect(out.returned).toBe(1); // page is one drive...
+    expect(out.total).toBe(3); // ...of three fetched
+    // Range spans all three fetched records, not just the returned page.
+    expect(out.date_range).toEqual({
+      earliest: "2026-07-01",
+      latest: "2026-07-02"
+    });
+    expect(out.coverage_note).toContain("since you joined TeslaFi");
+    expect(out.coverage_note).toContain("2026-07-01");
+  });
+
+  it("charges carry an energy-worded coverage note", async () => {
+    const res = await callTool("tesla_get_charges", {
+      response_format: "json"
+    });
+    const out = res.structuredContent;
+    expect(out.date_range.earliest).toBe("2026-07-03");
+    expect(out.coverage_note).toMatch(/excludes any energy before that date/);
+  });
+
+  it("drives markdown reports the count honestly with the since-date", async () => {
+    const md = text(
+      await callTool("tesla_get_drives", {
+        date_from: "2026-07-12",
+        date_to: "2026-07-13"
+      })
+    );
+    expect(md).toContain("3 drives on record (since 2026-07-01)");
+    expect(md).toMatch(/showing 1.3/); // "showing 1–3" (en dash)
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account-measure resolution (tier 3): remembered from a prior feed response
+// ---------------------------------------------------------------------------
+
+describe("account-measure resolution", () => {
+  it("history tools honor the account measure remembered from a feed response", async () => {
+    mockAxios.mockReset();
+    mockAxios.mockImplementation(async (config: any) => {
+      if (
+        typeof config?.url === "string" &&
+        config.url.includes("history.php")
+      ) {
+        return {
+          data: {
+            count: 1,
+            results: [
+              {
+                id: "9",
+                date: "2026-11-01 08:00:00",
+                startingLocationName: "Home",
+                locationName: "Acme HQ",
+                kilometers: "10",
+                miles: "6.2"
+              }
+            ]
+          }
+        };
+      }
+      // A feed advertising an imperial account.
+      return { data: { ...FEED_DATA, measure: "imperial" } };
+    });
+
+    // Observe the feed so the account measure is remembered in memory.
+    await callTool("tesla_get_current_data");
+
+    // A history call with NO units arg now resolves to imperial (tier 3).
+    const res = await callTool("tesla_get_drives", {
+      date_from: "2026-11-01",
+      date_to: "2026-11-02",
+      response_format: "json"
+    });
+    expect(res.structuredContent.units).toBe("imperial");
+    expect(res.structuredContent.drives[0].distance_mi).toBe(6.2);
+    expect(res.structuredContent.drives[0]).not.toHaveProperty("distance_km");
+
+    // Restore the remembered measure to metric so later files/tests are stable.
+    mockAxios.mockImplementation(async () => ({
+      data: { ...FEED_DATA, measure: "metric" }
+    }));
+    await callTool("tesla_get_current_data");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manifest: TESLAFI_UNITS user_config + env wiring
+// ---------------------------------------------------------------------------
+
+describe("manifest user_config (units)", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../manifest.json", import.meta.url), "utf8")
+  );
+
+  it("declares a units select with the three options and an automatic default", () => {
+    const u = manifest.user_config.units;
+    expect(u).toBeDefined();
+    expect(u.type).toBe("string");
+    expect(u.default).toBe("automatic");
+    expect(u.enum).toEqual(["automatic", "metric", "imperial"]);
+    expect(u.enum_labels).toEqual([
+      "Automatic (account default)",
+      "Metric",
+      "Imperial"
+    ]);
+    expect(u.required).toBe(false);
+  });
+
+  it("wires TESLAFI_UNITS into the server env from user_config.units", () => {
+    expect(manifest.server.mcp_config.env.TESLAFI_UNITS).toBe(
+      "${user_config.units}"
+    );
+  });
+
+  it("bumps the manifest version to 2.3.0", () => {
+    expect(manifest.version).toBe("2.3.0");
   });
 });

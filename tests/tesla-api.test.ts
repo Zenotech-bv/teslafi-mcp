@@ -8,11 +8,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios, { AxiosError } from "axios";
 import TeslaFIAPI, {
+  barToPsi,
   CAR_COMMANDS,
+  cToF,
   indicatesUnsentAsleep,
   isMonthlyAllowanceError,
   MAX_ANALYSIS_TRIPS,
+  miToKm,
   monthToDateRange,
+  mphToKmh,
+  mToFt,
+  normalizeFeedData,
+  psiToBar,
+  resolveUnits,
+  selectDriveUnitFields,
   TESLAFI_COMMAND_NAMES,
   TESLAFI_COMMAND_PARAMS
 } from "../src/services/tesla-api.js";
@@ -1409,6 +1418,10 @@ describe("service method happy paths", () => {
       end_location: "Acme HQ",
       distance: 25.4,
       distance_unit: "km",
+      // Both systems are selected from TeslaFi's pre-existing fields (not
+      // re-converted), so the unit-aware renderers can present either.
+      distance_km: 25.4,
+      distance_mi: 15.8,
       duration_minutes: 31
     });
     expect(trips[0]).not.toHaveProperty("raw");
@@ -1582,5 +1595,260 @@ describe("monthToDateRange", () => {
       dateFrom: "2026-03-01",
       dateTo: "2026-03-31"
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Units: resolution order (pure, no network)
+// ---------------------------------------------------------------------------
+
+describe("resolveUnits resolution order", () => {
+  it("tier 1: an explicit arg wins over env and account measure", () => {
+    expect(resolveUnits("imperial", "metric", "metric")).toBe("imperial");
+    expect(resolveUnits("both", "metric", "imperial")).toBe("both");
+    expect(resolveUnits("metric", "imperial", "imperial")).toBe("metric");
+  });
+
+  it("tier 2: TESLAFI_UNITS env is honored (case-insensitive, trimmed)", () => {
+    expect(resolveUnits(undefined, "Imperial", "metric")).toBe("imperial");
+    expect(resolveUnits(undefined, "  METRIC ", "imperial")).toBe("metric");
+  });
+
+  it("ignores an invalid/unknown env value and falls through", () => {
+    // "automatic" is the manifest default sentinel: it must be ignored so the
+    // account measure (tier 3) decides.
+    expect(resolveUnits(undefined, "automatic", "imperial")).toBe("imperial");
+    expect(resolveUnits(undefined, "furlongs", null)).toBe("metric");
+    expect(resolveUnits(undefined, "", "metric")).toBe("metric");
+    // env "both" is NOT a valid pin (env only pins metric/imperial).
+    expect(resolveUnits(undefined, "both", "imperial")).toBe("imperial");
+  });
+
+  it("tier 3: account measure ('metric' -> metric; anything else -> imperial)", () => {
+    expect(resolveUnits(undefined, undefined, "metric")).toBe("metric");
+    expect(resolveUnits(undefined, undefined, "Metric")).toBe("metric");
+    expect(resolveUnits(undefined, undefined, "imperial")).toBe("imperial");
+    expect(resolveUnits(undefined, undefined, "us")).toBe("imperial");
+  });
+
+  it("tier 4: metric fallback when nothing is set", () => {
+    expect(resolveUnits(undefined, undefined, undefined)).toBe("metric");
+    expect(resolveUnits(null, null, null)).toBe("metric");
+    expect(resolveUnits(undefined, undefined, "")).toBe("metric");
+  });
+
+  it("rejects an invalid explicit arg and falls through to lower tiers", () => {
+    expect(resolveUnits("bogus", "imperial", "metric")).toBe("imperial");
+    // The enum is case-sensitive: "BOTH" is not accepted, falls to measure.
+    expect(resolveUnits("BOTH", undefined, "metric")).toBe("metric");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Units: live-feed conversions (Tesla-native -> chosen system)
+// ---------------------------------------------------------------------------
+
+describe("unit converters", () => {
+  it("miToKm / mphToKmh use the 1.609344 factor (rounded to 1 dp for display)", () => {
+    expect(miToKm(100)).toBe(160.9); // 160.9344 -> 160.9
+    expect(miToKm(1)).toBe(1.6); // 1.609344 -> 1.6
+    expect(mphToKmh(10)).toBe(16.1); // 16.09344 -> 16.1
+  });
+
+  it("cToF converts Celsius to Fahrenheit by formula", () => {
+    expect(cToF(0)).toBe(32);
+    expect(cToF(100)).toBe(212);
+    expect(cToF(20)).toBe(68);
+  });
+
+  it("psiToBar / barToPsi round-trip with the 14.5037738 factor", () => {
+    expect(psiToBar(14.5037738)).toBeCloseTo(1, 2);
+    expect(barToPsi(1)).toBeCloseTo(14.5, 1);
+  });
+
+  it("mToFt converts metres to feet", () => {
+    expect(mToFt(100)).toBeCloseTo(328.1, 1);
+  });
+});
+
+describe("normalizeFeedData live-feed conversions", () => {
+  it("converts miles->km for metric and keeps miles for imperial", () => {
+    const raw = { odometer: "100" };
+    const m = normalizeFeedData(raw, "metric");
+    expect(m.odometer_km).toBeCloseTo(160.9, 1);
+    expect(m).not.toHaveProperty("odometer_mi");
+
+    const im = normalizeFeedData(raw, "imperial");
+    expect(im.odometer_mi).toBe(100);
+    expect(im).not.toHaveProperty("odometer_km");
+  });
+
+  it("converts mph->km/h for speed", () => {
+    expect(normalizeFeedData({ speed: "60" }, "metric").speed_kmh).toBeCloseTo(
+      96.6,
+      1
+    );
+    expect(normalizeFeedData({ speed: "60" }, "imperial").speed_mph).toBe(60);
+  });
+
+  it("prefers the provided *F field for imperial temperatures", () => {
+    // A deliberately inconsistent *F value proves the *F field is used, not
+    // the C->F formula (which would give 68).
+    const im = normalizeFeedData(
+      { inside_temp: "20", inside_tempF: "70" },
+      "imperial"
+    );
+    expect(im.inside_temp_f).toBe(70);
+    expect(im).not.toHaveProperty("inside_temp_c");
+  });
+
+  it("derives °F via formula when no *F field is present", () => {
+    const im = normalizeFeedData(
+      { passenger_temp_setting: "20" },
+      "imperial"
+    );
+    expect(im.passenger_temp_setting_f).toBeCloseTo(68, 1);
+  });
+
+  it("keeps °C for metric and consumes the *F source field", () => {
+    const m = normalizeFeedData(
+      { inside_temp: "21.5", inside_tempF: "70" },
+      "metric"
+    );
+    expect(m.inside_temp_c).toBe(21.5);
+    expect(m).not.toHaveProperty("inside_temp_f");
+    expect(m).not.toHaveProperty("inside_tempF"); // *F source consumed
+    expect(m).not.toHaveProperty("inside_temp"); // no bare physical field
+  });
+
+  it("converts psi->bar for metric and keeps psi for imperial", () => {
+    const m = normalizeFeedData({ tpms_front_left: "42" }, "metric");
+    expect(m.tpms_front_left_bar).toBeCloseTo(42 / 14.5037738, 2);
+    expect(normalizeFeedData({ tpms_front_left: "42" }, "imperial")
+      .tpms_front_left_psi).toBe(42);
+  });
+
+  it("converts elevation metres->feet for imperial, keeps metres for metric", () => {
+    expect(normalizeFeedData({ elevation: "100" }, "metric").elevation_m).toBe(
+      100
+    );
+    expect(
+      normalizeFeedData({ elevation: "100" }, "imperial").elevation_ft
+    ).toBeCloseTo(328.1, 1);
+  });
+
+  it("never converts kWh or percent — only labels them (single field)", () => {
+    const both = normalizeFeedData(
+      { charge_energy_added: "18.6", battery_level: "72" },
+      "both"
+    );
+    expect(both.charge_energy_added_kwh).toBe(18.6);
+    expect(both.battery_level_pct).toBe(72);
+    // No system-specific variants for kWh / percent.
+    expect(both).not.toHaveProperty("charge_energy_added_kwh_mi");
+    expect(both).not.toHaveProperty("battery_level_pct_mi");
+  });
+
+  it("both-mode emits BOTH suffixed fields for a converted quantity", () => {
+    const both = normalizeFeedData({ odometer: "100" }, "both");
+    expect(both.odometer_km).toBeCloseTo(160.9, 1);
+    expect(both.odometer_mi).toBe(100);
+  });
+
+  it("passes non-physical fields through and stamps a top-level units", () => {
+    const out = normalizeFeedData(
+      { state: "online", display_name: "Car", measure: "metric" },
+      "metric"
+    );
+    expect(out.state).toBe("online");
+    expect(out.display_name).toBe("Car");
+    expect(out.measure).toBe("metric");
+    expect(out.units).toBe("metric");
+  });
+
+  it("emits null (never a bare value) for an empty physical field", () => {
+    const out = normalizeFeedData({ odometer: "" }, "metric");
+    expect(out.odometer_km).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Units: history field selection (records already carry BOTH systems)
+// ---------------------------------------------------------------------------
+
+describe("selectDriveUnitFields (history field selection)", () => {
+  const REC = {
+    kilometers: "40",
+    miles: "24.85",
+    whKilo: "150",
+    whMile: "241",
+    speedAVGK: "48",
+    speedAVG: "30",
+    speedMAXK: "100",
+    speedMAX: "62",
+    // Single-source history fields: °C only and bar only.
+    temperatureAVG: "20",
+    tpmsAvg: "2.9",
+    driveKwh: "7.4"
+  };
+
+  it("metric selects TeslaFi's own metric fields (kilometers/whKilo/speedAVGK)", () => {
+    const m = selectDriveUnitFields(REC, "metric");
+    expect(m.distance_km).toBe(40);
+    expect(m.efficiency_wh_km).toBe(150);
+    expect(m.speed_avg_kmh).toBe(48);
+    expect(m.speed_max_kmh).toBe(100);
+    expect(m).not.toHaveProperty("distance_mi");
+    expect(m).not.toHaveProperty("efficiency_wh_mi");
+    // Single-source fields keep their native metric unit.
+    expect(m.temperature_avg_c).toBe(20);
+    expect(m.tpms_avg_bar).toBe(2.9);
+    expect(m.drive_kwh).toBe(7.4);
+    expect(m).not.toHaveProperty("temperature_avg_f");
+    expect(m).not.toHaveProperty("tpms_avg_psi");
+  });
+
+  it("imperial selects TeslaFi's own imperial fields (miles/whMile/speedAVG)", () => {
+    const im = selectDriveUnitFields(REC, "imperial");
+    expect(im.distance_mi).toBe(24.85);
+    expect(im.efficiency_wh_mi).toBe(241);
+    expect(im.speed_avg_mph).toBe(30);
+    expect(im.speed_max_mph).toBe(62);
+    expect(im).not.toHaveProperty("distance_km");
+    expect(im).not.toHaveProperty("speed_avg_kmh");
+    // Single-source fields are CONVERTED for imperial (only these two, since
+    // TeslaFi stores temps in °C and tyre pressure in bar).
+    expect(im.temperature_avg_f).toBeCloseTo(68, 1); // 20 °C -> 68 °F
+    expect(im.tpms_avg_psi).toBeCloseTo(2.9 * 14.5037738, 1); // bar -> psi
+    expect(im.drive_kwh).toBe(7.4); // kWh never converts
+    expect(im).not.toHaveProperty("temperature_avg_c");
+    expect(im).not.toHaveProperty("tpms_avg_bar");
+  });
+
+  it("NEITHER path re-converts (selected values are TeslaFi's, not derived)", () => {
+    const m = selectDriveUnitFields(REC, "metric");
+    const im = selectDriveUnitFields(REC, "imperial");
+    // Re-converting miles->km would give 24.85*1.609344 = 39.99..., not 40.
+    expect(m.distance_km).toBe(40);
+    // Re-converting speedAVGK->mph would give 48/1.609344 = 29.8, not 30.
+    expect(im.speed_avg_mph).toBe(30);
+  });
+
+  it("both-mode returns both systems' selected fields", () => {
+    const both = selectDriveUnitFields(REC, "both");
+    expect(both.distance_km).toBe(40);
+    expect(both.distance_mi).toBe(24.85);
+    expect(both.efficiency_wh_km).toBe(150);
+    expect(both.efficiency_wh_mi).toBe(241);
+    expect(both.speed_avg_kmh).toBe(48);
+    expect(both.speed_avg_mph).toBe(30);
+  });
+
+  it("missing per-system fields become null", () => {
+    const m = selectDriveUnitFields({ kilometers: "10" }, "metric");
+    expect(m.distance_km).toBe(10);
+    expect(m.efficiency_wh_km).toBeNull();
+    expect(m.speed_avg_kmh).toBeNull();
+    expect(m.speed_max_kmh).toBeNull();
   });
 });

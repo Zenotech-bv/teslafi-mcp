@@ -3,6 +3,51 @@
 All notable changes to the TeslaFi MCP server are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.0] — 2026-07-20
+
+### Added
+
+- **Selectable units on every data-returning tool.** `tesla_get_current_data`,
+  `tesla_get_drives`, `tesla_get_charges`, `tesla_get_trips_for_month`,
+  `tesla_analyze_home_work_trips`, and `tesla_get_locations` take an optional
+  `units` argument — `"metric"`, `"imperial"`, or `"both"` — and every response
+  now carries a top-level `units` field stating the applied system.
+- **Effective-unit resolution.** When `units` is omitted it is resolved in
+  order: the explicit argument, then the new `TESLAFI_UNITS` env var
+  (`metric`/`imperial`, case-insensitive; other values ignored), then the
+  TeslaFi account `measure` (remembered in memory from the most recent feed
+  response), then metric. The OS locale is not visible to the server, so
+  `TESLAFI_UNITS` is the documented way to pin a default.
+- **`TESLAFI_UNITS` configuration.** Documented in the README config table and
+  added to `manifest.json` `user_config` as an "Automatic / Metric / Imperial"
+  select (default Automatic), wired into `server.mcp_config.env`.
+- **Explicit unit fields everywhere.** Every physical quantity in the
+  normalized/summary/structured output carries its unit as a field-name suffix
+  (`_km`/`_mi`, `_kmh`/`_mph`, `_c`/`_f`, `_bar`/`_psi`, `_kwh`, `_m`/`_ft`,
+  `_pct`); with `units: "both"` both suffixed fields are emitted. Every
+  markdown renderer prints the unit next to every number. Live-feed values
+  (Tesla-native regardless of account) are converted to the chosen system,
+  while history records (which already carry both systems) have the pre-existing
+  field selected — never re-converted — to avoid double conversion/rounding
+  drift. Percentages, kWh, and currency are never converted, only labeled.
+- **History coverage metadata.** `tesla_get_drives`, `tesla_get_charges`, and
+  `tesla_get_trips_for_month` now return `date_range` (`{ earliest, latest }`,
+  computed from the full fetched dataset before pagination — no extra network
+  call) and `coverage_note`, so a client cannot mislabel a partial history
+  fetch as a "lifetime" figure. The markdown reports counts honestly too
+  (e.g. `2,526 drives on record (since 2023-12-18); showing 1–50`).
+
+### Changed
+
+- **BREAKING — output field names are now unit-suffixed.** Compact drive/charge
+  summaries, trip objects, and the live-feed structured output changed shape:
+  physical fields are renamed to unit-suffixed names for the applied system
+  (e.g. the old drive `distance_km`/`distance_mi` pair is now emitted per the
+  chosen `units`; `tesla_get_current_data` structured output is now a normalized
+  object with suffixed fields plus passthrough of non-physical fields, rather
+  than the raw feed record). `include_raw` still embeds the untouched raw
+  record. Clients that read fixed field names must update to the suffixed names.
+
 ## [2.2.0] — 2026-07-19
 
 ### Added

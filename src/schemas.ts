@@ -17,6 +17,21 @@ const isoDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format");
 
+/**
+ * Reusable units field for the data-returning tools. When omitted, the server
+ * resolves the effective system from the TESLAFI_UNITS env var, then the
+ * TeslaFi account's `measure` setting, then metric. The OS locale is not
+ * visible to the server, so TESLAFI_UNITS is the way to pin a default.
+ */
+const unitsParam = z
+  .enum(["metric", "imperial", "both"])
+  .optional()
+  .describe(
+    "Units for physical quantities: 'metric' (km, °C, bar), 'imperial' " +
+      "(mi, °F, psi), or 'both' (both suffixed fields). When omitted, resolved " +
+      "from TESLAFI_UNITS, then your TeslaFi account measure setting, else metric."
+  );
+
 /** Reusable include-raw field: raw TeslaFi records are omitted by default. */
 const includeRaw = z
   .boolean()
@@ -48,6 +63,7 @@ export const AnalyzeHomeWorkTripsSchema = z
       .min(1)
       .max(100)
       .describe("Name of work location (e.g., 'Acme HQ')"),
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
@@ -82,6 +98,7 @@ export const GetTripsForMonthSchema = z
       .default(0)
       .describe("Number of trips to skip for pagination (default: 0)"),
     include_raw: includeRaw,
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
@@ -99,6 +116,7 @@ export const GetLocationsSchema = z
     date_to: isoDate
       .optional()
       .describe("Only include drives on/before this date (YYYY-MM-DD)"),
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
@@ -117,6 +135,7 @@ export const GetCurrentDataSchema = z
         "Which data point to fetch: 'current' (latest, may be sparse while sleeping), " +
           "'lastGood' (last point with full charge data), or 'lastGoodTemp' (last point with temperatures)"
       ),
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
@@ -148,6 +167,7 @@ export const GetDrivesSchema = z
       .default(0)
       .describe("Number of drives to skip for pagination (default: 0)"),
     include_raw: includeRaw,
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
@@ -179,6 +199,7 @@ export const GetChargesSchema = z
       .default(0)
       .describe("Number of charges to skip for pagination (default: 0)"),
     include_raw: includeRaw,
+    units: unitsParam,
     response_format: responseFormat
   })
   .strict();
