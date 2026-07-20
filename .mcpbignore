@@ -79,3 +79,4 @@ node_modules/tslib/
 /.git/
 /.gitignore
 /CONTRIBUTING.md
+/CLAUDE.md
