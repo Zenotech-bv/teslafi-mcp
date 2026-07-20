@@ -372,12 +372,26 @@ default** because it adds a second network destination.
   disables), keyed by endpoint + date range, so pagination and the
   commute-analysis tools reuse a single fetch. Failures are never cached, and
   nothing is written to disk.
-- **Request spacing** — outbound requests to TeslaFi are spaced at least 1
-  second apart, to stay within TeslaFi's per-minute API request limits.
-- **Proactive rate-limit pacing** — when TeslaFi's embedded `rate_limit`
-  object last reported `remaining: 0`, the next request waits out the
-  remainder of the reported reset window (capped at 60 s) instead of firing a
-  guaranteed HTTP 429. The pacing state is in-memory only.
+- **Adaptive request spacing** — outbound requests are always spaced at least 1
+  second apart, and on top of that an **in-memory token bucket** paces sustained
+  load to stay within TeslaFi's advertised per-window budget. The bucket is
+  self-tuning: its capacity and refill rate are derived from the `rate_limit`
+  object TeslaFi embeds in responses (`{"limit": 15, "remaining": N,
+  "reset_in_seconds": 60}` → a bucket of ~15 tokens refilling at ~limit/window,
+  i.e. ~4 s per token for 15/60). Each request spends one token. This
+  intentionally allows an **initial burst up to the advertised budget** — so a
+  handful of tool calls stay fast — then **glides down to the steady refill
+  rate** under sustained use, converging toward the reset instead of bursting to
+  the wall and stalling. Before any `rate_limit` has been observed (and whenever
+  the advertised limit or window is missing, zero, or nonsensical) pacing falls
+  back to the 1 s floor alone; any single computed wait is capped (never more
+  than one window, and never more than 60 s) so a garbled value cannot hang a
+  request. The pacing is purely internal — no tool parameter or output changed.
+- **Proactive rate-limit backstop** — when the embedded `rate_limit` last
+  reported `remaining: 0`, the next request additionally waits out the remainder
+  of the reported reset window (capped at 60 s) instead of firing a guaranteed
+  HTTP 429. This remains a backstop beneath the token bucket; all pacing state is
+  in-memory only.
 - **Retries** — transient failures are retried up to 2 times with exponential
   backoff and jitter. An HTTP 429 is retried only when TeslaFi supplies a
   `Retry-After` of at most 60 s; a 429 without that header, or asking for a

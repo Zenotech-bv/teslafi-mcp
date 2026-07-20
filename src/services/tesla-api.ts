@@ -16,7 +16,7 @@ const MAX_RETRY_AFTER_MS = 60000;
  * the version is never hardcoded in two places that can silently drift. Must
  * match package.json and manifest.json (asserted by a test).
  */
-export const VERSION = "2.5.0";
+export const VERSION = "2.6.0";
 
 /**
  * Shared env-flag truthiness test: an environment variable is "on" only when it
@@ -257,6 +257,14 @@ export interface QuotaUsage {
 
 /** Last-known per-minute rate-limit state, as reported by TeslaFi. */
 interface RateLimitState {
+  /**
+   * The advertised budget (`rate_limit.limit`, e.g. 15 requests per window).
+   * May be NaN when TeslaFi omitted or garbled it; the token bucket validates
+   * it before deriving capacity, so a bad value simply leaves pacing on the
+   * 1s floor. remaining/resetInSeconds are still trusted for the
+   * remaining===0 hard wait regardless of `limit`.
+   */
+  limit: number;
   remaining: number;
   resetInSeconds: number;
   /** Date.now() timestamp of the response that carried the rate limit. */
@@ -315,6 +323,22 @@ class TeslaFIAPI {
   private lastQuota: QuotaUsage | null = null;
   /** Last-known per-minute rate-limit state (in-memory only). */
   private lastRateLimit: RateLimitState | null = null;
+  /**
+   * Proactive, adaptive token bucket derived from TeslaFi's advertised
+   * rate_limit (capacity = advertised `limit`, refill = limit / window). It
+   * paces SUSTAINED load down to the steady refill rate while still allowing a
+   * short initial BURST up to the advertised budget, so a handful of tool calls
+   * stay fast. All four fields are in-memory only and are meaningful only while
+   * `bucketCapacity > 0`; until a valid limit+window has been observed the
+   * bucket is inert and pacing falls back to the 1s floor alone. Never persisted.
+   */
+  private bucketCapacity = 0;
+  /** Refill rate in tokens per millisecond (limit / windowMs); 0 == inert. */
+  private bucketRefillPerMs = 0;
+  /** Current token level (fractional); replenished by elapsed time, capped at capacity. */
+  private bucketTokens = 0;
+  /** Date.now() the bucket was last refilled/consumed against. */
+  private bucketRefilledAt = 0;
   /**
    * Last-known account unit preference, taken from the `measure` field of the
    * most recent feed response seen this session (in-memory only; never
@@ -798,8 +822,21 @@ class TeslaFIAPI {
         const resetInSeconds = Number(
           (rateLimit as Record<string, unknown>).reset_in_seconds
         );
+        // The advertised budget. Parsed permissively (may be NaN when absent
+        // or garbled) and validated later by syncTokenBucket — it never gates
+        // the remaining/resetInSeconds capture that drives the remaining===0
+        // hard wait, so an absent `limit` cannot disable that backstop.
+        const limit = Number((rateLimit as Record<string, unknown>).limit);
         if (Number.isFinite(remaining) && Number.isFinite(resetInSeconds)) {
-          this.lastRateLimit = { remaining, resetInSeconds, at: Date.now() };
+          this.lastRateLimit = {
+            limit,
+            remaining,
+            resetInSeconds,
+            at: Date.now()
+          };
+          // Re-derive the token-bucket size/rate from this fresh advertised
+          // limit+window (self-tuning). Safe no-op when limit/window are bad.
+          this.syncTokenBucket();
         }
       }
     }
@@ -821,6 +858,103 @@ class TeslaFIAPI {
       MAX_RETRY_AFTER_MS
     );
     return Math.max(0, windowMs - (Date.now() - rateLimit.at));
+  }
+
+  /**
+   * (Re)derive the token bucket from the last-observed advertised limit+window.
+   *
+   * capacity  = advertised `limit` (the burst budget)
+   * refill    = limit / window  tokens per second  (the steady rate)
+   *
+   * Self-tuning + safe fallback: when the advertised limit or window is
+   * missing, zero, negative, or non-finite, the bucket is left UNCHANGED — so
+   * before any valid observation it stays inert (pacing = 1s floor only), and
+   * after a valid one a later garbled value simply keeps the last good sizing
+   * rather than dividing by zero or assuming a limit. Tokens are seeded to full
+   * capacity ONLY when the capacity first appears or genuinely changes, so
+   * ordinary responses refill the bucket by elapsed time instead of resetting
+   * the burst allowance on every reply.
+   */
+  private syncTokenBucket(): void {
+    const rl = this.lastRateLimit;
+    if (!rl) {
+      return;
+    }
+    const limit = rl.limit;
+    const windowSeconds = rl.resetInSeconds;
+    if (
+      !Number.isFinite(limit) ||
+      limit <= 0 ||
+      !Number.isFinite(windowSeconds) ||
+      windowSeconds <= 0
+    ) {
+      // Nonsensical advertised values: never assume a limit, never divide by
+      // zero. Leave whatever (possibly inert) bucket state we already had.
+      return;
+    }
+    this.bucketRefillPerMs = limit / (windowSeconds * 1000);
+    if (limit !== this.bucketCapacity) {
+      // First valid observation (0 -> limit) or a genuine change in the
+      // advertised budget: (re)seed full so a short interaction can burst.
+      this.bucketCapacity = limit;
+      this.bucketTokens = limit;
+      this.bucketRefilledAt = Date.now();
+    }
+  }
+
+  /**
+   * Token-bucket component of the pre-send wait: refill (read-only) by the
+   * elapsed time and return how long to wait for the next whole token when the
+   * bucket is empty, or 0 when a token is already available. Returns 0 while
+   * the bucket is inert (no valid advertised limit/window observed yet), which
+   * preserves the original 1s-floor-only behavior. The wait is capped at one
+   * window and never more than MAX_RETRY_AFTER_MS so a garbled advertised value
+   * cannot hang a request. The token is not spent here — consumeToken() does
+   * that at actual send time — so composing this via max() with the other
+   * waits never over-counts.
+   */
+  private tokenBucketWaitMs(): number {
+    if (this.bucketCapacity <= 0 || this.bucketRefillPerMs <= 0) {
+      return 0;
+    }
+    const available = this.currentTokens();
+    if (available >= 1) {
+      return 0;
+    }
+    const wait = (1 - available) / this.bucketRefillPerMs;
+    // One token can never take longer than the whole window to refill; cap
+    // there (and at the global 60s ceiling) purely as a garbage-value guard.
+    const windowMs = this.bucketCapacity / this.bucketRefillPerMs;
+    const cap = Math.min(windowMs, MAX_RETRY_AFTER_MS);
+    return Math.max(0, Math.min(wait, cap));
+  }
+
+  /** Bucket level right now: stored tokens plus elapsed-time refill, capped. */
+  private currentTokens(): number {
+    const elapsed = Math.max(0, Date.now() - this.bucketRefilledAt);
+    return Math.min(
+      this.bucketCapacity,
+      this.bucketTokens + elapsed * this.bucketRefillPerMs
+    );
+  }
+
+  /**
+   * Spend one token at actual send time: refill by elapsed time (capped at
+   * capacity), subtract the token this request consumes, and advance the refill
+   * clock. No-op while the bucket is inert. Because a send only happens after
+   * waiting at least tokenBucketWaitMs(), the refilled level is normally >= 1
+   * here (so tokens stay >= 0); a small negative is possible only when a single
+   * wait was capped for a garbled advertised value, and it self-heals as the
+   * bucket refills. The level is floored at -capacity so repeated capped waits
+   * can never drive it unboundedly negative (which would wedge later requests).
+   */
+  private consumeToken(): void {
+    if (this.bucketCapacity <= 0 || this.bucketRefillPerMs <= 0) {
+      return;
+    }
+    const refilled = this.currentTokens();
+    this.bucketTokens = Math.max(-this.bucketCapacity, refilled - 1);
+    this.bucketRefilledAt = Date.now();
   }
 
   /**
@@ -1126,10 +1260,19 @@ class TeslaFIAPI {
   }
 
   /**
-   * Enforce a minimum spacing between outbound requests (in-memory gate),
-   * plus proactive rate-limit pacing: when TeslaFi last reported
-   * rate_limit.remaining === 0, wait out the remainder of the reported reset
-   * window (capped at 60s) instead of firing a guaranteed 429.
+   * Enforce a minimum spacing between outbound requests (in-memory gate) and
+   * compose three pacing signals into a single pre-send wait, taking their
+   * max() so each one is a floor the others cannot undercut:
+   *   1. the fixed 1s spacing between consecutive sends;
+   *   2. proactive ADAPTIVE token-bucket pacing derived from TeslaFi's
+   *      advertised rate_limit — bursts up to the advertised budget then glides
+   *      to the steady limit/window rate under sustained load;
+   *   3. the reactive backstop: when TeslaFi last reported
+   *      rate_limit.remaining === 0, wait out the remainder of the reported
+   *      reset window (capped at 60s) instead of firing a guaranteed 429.
+   * The requestGate serializes callers, so exactly one request is between its
+   * wait decision and its token spend at a time. The token is spent at send
+   * time (consumeToken), after the wait, so it is never over-counted.
    */
   private throttle(): Promise<void> {
     const previous = this.requestGate;
@@ -1141,11 +1284,16 @@ class TeslaFIAPI {
       .then(() => {
         const spacingMs =
           MIN_REQUEST_SPACING_MS - (Date.now() - this.lastRequestAt);
-        const waitMs = Math.max(spacingMs, this.rateLimitDelayMs());
+        const waitMs = Math.max(
+          spacingMs,
+          this.tokenBucketWaitMs(),
+          this.rateLimitDelayMs()
+        );
         return waitMs > 0 ? sleep(waitMs) : undefined;
       })
       .then(() => {
         this.lastRequestAt = Date.now();
+        this.consumeToken();
         release();
       });
   }

@@ -3,6 +3,45 @@
 All notable changes to the TeslaFi MCP server are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.0] — 2026-07-20
+
+### Added
+
+- **Proactive, adaptive request pacing (in-memory token bucket).** Sustained
+  load now *glides* within TeslaFi's advertised rate limit instead of bursting
+  to the wall and stalling. A token bucket is derived from the `rate_limit`
+  object TeslaFi embeds in responses — capacity ≈ the advertised `limit` and
+  refill ≈ `limit / reset_in_seconds` tokens per second (e.g. a 15-token bucket
+  refilling one token every ~4 s for the documented 15-requests-per-60 s
+  budget). Each outbound request spends one token. This intentionally allows an
+  **initial burst up to the advertised budget** — so short, typical
+  interactions (a handful of tool calls) stay fast — and then **converges to the
+  steady refill rate** under sustained use, pacing toward the window reset
+  rather than slamming into `remaining: 0`. The newly-captured advertised
+  `limit` (previously ignored) drives the sizing.
+
+### Changed
+
+- **Request spacing is now composed, not just fixed.** The pre-send wait is the
+  maximum of three signals: the existing **1 s floor** between consecutive
+  sends, the new **token-bucket wait**, and the existing **`remaining: 0`
+  reset-window backstop** (capped at 60 s). All three remain in force — the 1 s
+  floor, the `remaining === 0` hard wait, and the HTTP 429 `Retry-After` retry
+  handling are unchanged backstops beneath the token bucket.
+
+### Notes
+
+- **Internal-only.** No tool, parameter, or output shape changed — this is
+  purely internal pacing. State is **in-memory per process**, with **zero disk
+  writes** and **no new network calls**.
+- **Self-tuning with a safe fallback.** Capacity/refill are re-derived from the
+  last-observed advertised limit+window. Before any `rate_limit` has been
+  observed, or when the advertised limit/window is missing, zero, non-finite, or
+  otherwise nonsensical, pacing falls back to the previous 1 s-floor-only
+  behavior (never assuming a limit, never dividing by zero). Any single computed
+  wait is capped at one window and never more than 60 s so a garbled advertised
+  value cannot hang a request.
+
 ## [2.5.0] — 2026-07-20
 
 ### Fixed

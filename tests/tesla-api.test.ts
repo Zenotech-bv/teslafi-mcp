@@ -1001,6 +1001,162 @@ describe("proactive rate-limit pacing", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Adaptive token-bucket pacing (proactive, derived from rate_limit.limit)
+// ---------------------------------------------------------------------------
+
+describe("adaptive token-bucket pacing", () => {
+  /** feed.php body carrying a full rate_limit object (limit + remaining + reset). */
+  const rlBody = (
+    limit: unknown,
+    remaining: unknown,
+    resetInSeconds: unknown
+  ) => ({
+    data: {
+      battery_level: 50,
+      rate_limit: { limit, remaining, reset_in_seconds: resetInSeconds }
+    }
+  });
+
+  it("lets a handful of requests burst at the 1s floor after observing the limit", async () => {
+    mockAxios.mockResolvedValue(rlBody(15, 15, 60));
+    await settle(api.getCurrentData()); // req 1 seeds the bucket (capacity 15)
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+
+    // Five follow-up requests each proceed at ~1s (well under the ~4s steady
+    // rate): the seeded burst budget keeps short interactions fast. Each
+    // response re-advertises limit=15 but must NOT reset the draining bucket.
+    for (let i = 2; i <= 6; i++) {
+      const p = api.getCurrentData();
+      await vi.advanceTimersByTimeAsync(1_050);
+      expect(mockAxios).toHaveBeenCalledTimes(i);
+      await p;
+    }
+  });
+
+  it("bursts up to the budget then paces sustained load to ~window/limit (~4s)", async () => {
+    const sends: number[] = [];
+    mockAxios.mockImplementation(() => {
+      sends.push(Date.now());
+      return Promise.resolve(rlBody(15, 15, 60));
+    });
+
+    // Fire many requests at once; they drain through the serializing gate.
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 30; i++) {
+      promises.push(api.getCurrentData());
+    }
+    await vi.runAllTimersAsync();
+    await Promise.all(promises);
+
+    expect(sends).toHaveLength(30);
+    const gaps = sends.slice(1).map((t, i) => t - sends[i]);
+    // Early gaps: the burst glides at roughly the 1s floor, far below 4s.
+    expect(gaps[0]).toBeLessThan(1_500);
+    expect(gaps[3]).toBeLessThan(1_500);
+    // Late gaps: once the burst budget drains, requests converge to
+    // window/limit = 60/15 = 4s (each 4s gap refills exactly one token).
+    const lastGap = gaps[gaps.length - 1];
+    expect(lastGap).toBeGreaterThanOrEqual(3_500);
+    expect(lastGap).toBeLessThanOrEqual(4_500);
+  });
+
+  it("refills during idle so a single later request is not token-paced", async () => {
+    // Small bucket (capacity 1, one token / 4s) so it drains in one request.
+    mockAxios.mockResolvedValue(rlBody(1, 5, 4));
+    await settle(api.getCurrentData()); // req 1 seeds bucket (capacity 1)
+
+    const p2 = api.getCurrentData(); // req 2 spends the only token
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await p2;
+
+    // Bucket is now empty; without idle the next request would wait ~4s. Idle
+    // well past the window so the bucket refills back to capacity.
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const p3 = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1_050); // only the 1s floor is needed
+    expect(mockAxios).toHaveBeenCalledTimes(3);
+    await p3;
+  });
+
+  it("empties the bucket then requires ~window/limit before the next send", async () => {
+    // capacity 1, one token / 4s: request 2 drains it, request 3 must wait ~4s.
+    mockAxios.mockResolvedValue(rlBody(1, 5, 4));
+    await settle(api.getCurrentData()); // seed
+
+    const p2 = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(mockAxios).toHaveBeenCalledTimes(2); // burst token spent
+    await p2;
+
+    const p3 = api.getCurrentData();
+    await vi.advanceTimersByTimeAsync(1_050); // the 1s floor alone is not enough
+    expect(mockAxios).toHaveBeenCalledTimes(2); // still waiting for a token
+    await vi.advanceTimersByTimeAsync(3_100); // ~4s total -> a token refilled
+    expect(mockAxios).toHaveBeenCalledTimes(3);
+    await p3;
+  });
+
+  it("stays on the 1s floor only while no rate_limit has been observed", async () => {
+    mockAxios.mockResolvedValue({ data: { battery_level: 50 } }); // no rate_limit
+    const p1 = api.getCurrentData();
+    const p2 = api.getCurrentData();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(997); // t ~= 998ms
+    expect(mockAxios).toHaveBeenCalledTimes(1); // no extra token-bucket wait
+    await vi.advanceTimersByTimeAsync(10); // past 1000ms
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+    await Promise.all([p1, p2]);
+  });
+
+  it.each([
+    ["absent limit", { remaining: 5, reset_in_seconds: 60 }],
+    ["zero limit", { limit: 0, remaining: 5, reset_in_seconds: 60 }],
+    ["negative limit", { limit: -3, remaining: 5, reset_in_seconds: 60 }],
+    ["non-finite limit", { limit: "lots", remaining: 5, reset_in_seconds: 60 }],
+    ["zero window", { limit: 15, remaining: 5, reset_in_seconds: 0 }],
+    ["non-finite window", { limit: 15, remaining: 5, reset_in_seconds: "soon" }]
+  ])(
+    "falls back to 1s-floor-only pacing for %s (no divide-by-zero, no hang)",
+    async (_label, rateLimit) => {
+      mockAxios.mockResolvedValue({
+        data: { battery_level: 50, rate_limit: rateLimit }
+      });
+      await settle(api.getCurrentData()); // observe the (bad) advertised value
+
+      const p = api.getCurrentData();
+      await vi.advanceTimersByTimeAsync(1_050); // only the existing 1s spacing
+      expect(mockAxios).toHaveBeenCalledTimes(2);
+      await p;
+    }
+  );
+
+  it("does not wedge when a retried read spends a token on each attempt", async () => {
+    mockAxios.mockResolvedValue(rlBody(15, 5, 60));
+    await settle(api.getCurrentData()); // seed bucket (capacity 15)
+
+    // One transient failure then success: throttle() (and consumeToken) runs
+    // twice for this single logical read. Must not deadlock the bucket.
+    mockAxios.mockReset();
+    mockAxios
+      .mockRejectedValueOnce(netError("ETIMEDOUT"))
+      .mockResolvedValue({ data: { count: 0 } });
+    await expect(settle(api.getDrives())).resolves.toEqual([]);
+    expect(mockAxios).toHaveBeenCalledTimes(2);
+
+    // A further request still proceeds promptly (the bucket was not driven into
+    // a negative wedge): plenty of burst budget remains.
+    const p = api.getDrives({ dateFrom: "2026-03-01" });
+    await vi.advanceTimersByTimeAsync(1_050);
+    expect(mockAxios).toHaveBeenCalledTimes(3);
+    await p;
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Quota usage tracking (tesla_request_counter memory)
 // ---------------------------------------------------------------------------
 
@@ -2292,8 +2448,8 @@ describe("inferLocationName", () => {
 // ---------------------------------------------------------------------------
 
 describe("VERSION constant", () => {
-  it("is the exported single source of truth (2.5.0)", () => {
-    expect(VERSION).toBe("2.5.0");
+  it("is the exported single source of truth (2.6.0)", () => {
+    expect(VERSION).toBe("2.6.0");
     // A default-constructed checker compares against VERSION.
     const checker = new UpdateChecker();
     expect(isNewerVersion("9.9.9", VERSION)).toBe(true);
