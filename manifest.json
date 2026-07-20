@@ -42,11 +42,9 @@
     "units": {
       "type": "string",
       "title": "Units",
-      "description": "Maps to TESLAFI_UNITS. Default unit system for physical quantities when a tool call does not pass `units`. 'Automatic (account default)' defers to your TeslaFi account's measure setting (then metric). The OS locale is not visible to the server, so this is the way to pin a default. 'Metric' uses km, °C, bar; 'Imperial' uses mi, °F, psi.",
+      "description": "Maps to TESLAFI_UNITS. Default unit system for physical quantities when a tool call does not pass `units`. One of: automatic, metric, imperial. 'automatic' (the default) defers to your TeslaFi account's measure setting (then metric). The OS locale is not visible to the server, so this is the way to pin a default. 'metric' uses km, °C, bar; 'imperial' uses mi, °F, psi.",
       "sensitive": false,
       "default": "automatic",
-      "enum": ["automatic", "metric", "imperial"],
-      "enum_labels": ["Automatic (account default)", "Metric", "Imperial"],
       "required": false
     }
   },

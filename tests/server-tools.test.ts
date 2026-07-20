@@ -1229,18 +1229,16 @@ describe("manifest user_config (units)", () => {
     readFileSync(new URL("../manifest.json", import.meta.url), "utf8")
   );
 
-  it("declares a units select with the three options and an automatic default", () => {
+  it("declares a units string field with an automatic default", () => {
     const u = manifest.user_config.units;
     expect(u).toBeDefined();
     expect(u.type).toBe("string");
     expect(u.default).toBe("automatic");
-    expect(u.enum).toEqual(["automatic", "metric", "imperial"]);
-    expect(u.enum_labels).toEqual([
-      "Automatic (account default)",
-      "Metric",
-      "Imperial"
-    ]);
     expect(u.required).toBe(false);
+    // MCPB has no formal enum/select type; the valid values live in the
+    // description and are enforced by resolveUnits (unknown values are ignored).
+    expect(u.enum).toBeUndefined();
+    expect(u.enum_labels).toBeUndefined();
   });
 
   it("wires TESLAFI_UNITS into the server env from user_config.units", () => {
