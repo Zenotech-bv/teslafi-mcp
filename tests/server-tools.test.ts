@@ -953,6 +953,38 @@ describe("tesla_get_charges", () => {
     });
     expect(result.structuredContent.charges[0].raw).toEqual(CHARGES[0]);
   });
+
+  it("labels an UNTAGGED charge (empty locationName) by its address, never blank/Unknown", async () => {
+    // The analogue of the getLocations gap: a charge at an untagged address
+    // carries locationName "". summarizeCharge already falls back to the
+    // address, so a home charger at an untagged address is still labeled.
+    const untaggedCharge = {
+      id: "999",
+      date: "2026-07-15 23:00:00",
+      locationName: "",
+      address: "9 Dorsett Road, Talbot Green",
+      totalEnergyAdded: "12.4"
+    };
+    mockAxios.mockImplementation(async (config: any) => {
+      if (typeof config?.url === "string" && config.url.includes("history.php")) {
+        return { data: { count: 1, results: [untaggedCharge] } };
+      }
+      return defaultRoute(config);
+    });
+
+    // A date range no other test uses, so the shared history cache can't serve
+    // a prior test's charges for this key.
+    const range = { date_from: "2026-10-15", date_to: "2026-10-16" };
+    const out = (
+      await callTool("tesla_get_charges", { ...range, response_format: "json" })
+    ).structuredContent;
+    expect(out.charges[0].location).toBe("9 Dorsett Road, Talbot Green");
+    expect(out.charges[0].location).not.toBe("Unknown");
+    expect(out.charges[0].location).not.toBe("");
+
+    const md = text(await callTool("tesla_get_charges", range));
+    expect(md).toContain("**9 Dorsett Road, Talbot Green** — +12.4 kWh");
+  });
 });
 
 describe("tesla_get_trips_for_month", () => {
@@ -1068,13 +1100,16 @@ describe("tesla_get_locations", () => {
       name: "Home",
       visits: 3,
       as_start: 2,
-      as_end: 1
+      as_end: 1,
+      named: true
     });
     expect(out.locations.map((l: any) => l.name)).toEqual([
       "Home",
       "Acme HQ",
       "Supermarket"
     ]);
+    // The default DRIVES are all tagged, so every entry is named.
+    expect(out.locations.every((l: any) => l.named === true)).toBe(true);
   });
 
   it("renders a markdown list", async () => {
@@ -1082,6 +1117,68 @@ describe("tesla_get_locations", () => {
     const md = text(result);
     expect(md).toContain("# Known Locations");
     expect(md).toContain("**Home** — 3 visits (2 starts, 1 ends)");
+    // No untagged entries here, so no "inferred" marker or note.
+    expect(md).not.toContain("inferred from address");
+  });
+
+  it("surfaces untagged frequently-visited locations with a named=false flag and marker", async () => {
+    // Drives to an untagged address (empty locationName, stable locationKey).
+    const untaggedDrives = [
+      {
+        id: "301",
+        date: "2026-07-01 08:00:00",
+        startingLocationName: "Home",
+        startingAddress: "1 Home St",
+        locationName: "",
+        locationKey: "9DorsettRo",
+        address: "9 Dorsett Road, Talbot Green, Pontyclun",
+        kilometers: "5.0",
+        miles: "3.1"
+      },
+      {
+        id: "302",
+        date: "2026-07-01 18:00:00",
+        startingLocationName: "",
+        startingLocationKey: "9DorsettRo",
+        startingAddress: "9 Dorsett Road, Talbot Green, Pontyclun",
+        locationName: "Home",
+        address: "1 Home St",
+        kilometers: "5.0",
+        miles: "3.1"
+      }
+    ];
+    mockAxios.mockImplementation(async (config: any) => {
+      if (typeof config?.url === "string" && config.url.includes("history.php")) {
+        return { data: { count: untaggedDrives.length, results: untaggedDrives } };
+      }
+      return defaultRoute(config);
+    });
+
+    // A date range no other test uses, so the shared history cache can't serve
+    // a prior test's drives for this key.
+    const range = { date_from: "2026-10-01", date_to: "2026-10-02" };
+    const json = await callTool("tesla_get_locations", {
+      ...range,
+      response_format: "json"
+    });
+    const locations = json.structuredContent.locations as any[];
+    const inferred = locations.find((l) => l.name.startsWith("9 Dorsett Road"));
+    expect(inferred).toEqual({
+      name: "9 Dorsett Road, Talbot Green",
+      visits: 2,
+      as_start: 1,
+      as_end: 1,
+      named: false
+    });
+    expect(locations.find((l) => l.name === "Home")).toMatchObject({
+      named: true
+    });
+
+    const md = text(await callTool("tesla_get_locations", range));
+    expect(md).toContain(
+      "**9 Dorsett Road, Talbot Green** — 2 visits (1 starts, 1 ends) _(inferred from address)_"
+    );
+    expect(md).toContain("inferred from address");
   });
 });
 
@@ -1383,8 +1480,8 @@ describe("manifest user_config (units)", () => {
     );
   });
 
-  it("keeps the VERSION constant, manifest, and package.json versions in lockstep (2.4.0)", () => {
-    expect(VERSION).toBe("2.4.0");
+  it("keeps the VERSION constant, manifest, and package.json versions in lockstep (2.5.0)", () => {
+    expect(VERSION).toBe("2.5.0");
     expect(manifest.version).toBe(VERSION);
     expect(pkg.version).toBe(VERSION);
   });

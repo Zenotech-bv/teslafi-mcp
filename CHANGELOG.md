@@ -3,6 +3,47 @@
 All notable changes to the TeslaFi MCP server are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.0] — 2026-07-20
+
+### Fixed
+
+- **Frequently-visited untagged locations were invisible to
+  `tesla_get_locations`.** The location aggregation only counted endpoints with
+  a non-empty `locationName`/`startingLocationName`, and only TeslaFi
+  *dashboard-tagged* locations ever carry one. Any place the owner visited — even
+  daily — that they had not separately geofenced+named inside TeslaFi Locations
+  settings was silently dropped, with no count and no ranking. (A car-nav
+  favorite is not the same thing as a TeslaFi-tagged Location and does not carry
+  a `locationName`.) The aggregation now **falls back to the stable per-address
+  key** (`locationKey` for the end endpoint, `startingLocationKey` for the start
+  endpoint) when the name is empty, deriving a readable display name from the
+  address (`address` / `startingAddress`) — so a place you visit often is
+  surfaced with the correct visit count even when you never tagged it. Named and
+  inferred groups are namespaced so they never collide, and an endpoint is
+  skipped only when its name **and** key **and** address are all empty. Existing
+  `visits` / `as_start` / `as_end` counting and the sort by `visits` descending
+  are unchanged.
+
+### Added
+
+- **`named` flag on every location entry.** `LocationSummary` gains a boolean
+  `named` field: `true` for owner-tagged TeslaFi locations (Home, Work, named
+  Superchargers), `false` for addresses inferred from repeated raw visits. It is
+  included in both the structured/JSON output and the markdown view (inferred
+  entries are marked *"(inferred from address)"* with an explanatory note); JSON
+  output stays pure and parseable.
+
+### Notes
+
+- `tesla_get_charges` was checked for the same gap. Its per-charge summary
+  **already** falls back to the address (`locationName || address || "Unknown"`),
+  so a charge at an untagged address is still labeled — no change was needed
+  there; a regression test now pins that behavior.
+- Behavior change (new inferred entries appear and every entry carries a new
+  `named` field) but **backward-compatible**: all previously-returned tagged
+  entries are still present, and the new field is purely additive. No tool
+  parameters changed.
+
 ## [2.4.0] — 2026-07-20
 
 ### Added

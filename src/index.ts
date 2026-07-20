@@ -600,8 +600,13 @@ server.registerTool(
     title: "Get Known Locations",
     description: `List the locations recorded in your TeslaFi drive history.
 
-Scans stored drives and returns unique named start/end locations with visit counts.
-Use these names with tesla_analyze_home_work_trips.
+Scans stored drives and returns unique start/end locations with visit counts.
+Includes BOTH owner-tagged TeslaFi locations (named=true — Home, Work, named
+Superchargers) AND frequently-visited but untagged places, inferred from
+repeated raw drive addresses and grouped by their stable location key
+(named=false, with a display name derived from the address). Each entry carries
+a boolean 'named' flag distinguishing the two. Use the named locations with
+tesla_analyze_home_work_trips.
 
 Args:
   - date_from (string, optional): Only include drives on/after this date (YYYY-MM-DD)
@@ -635,11 +640,24 @@ Example: "What locations does my car track?"`,
 
       const lines = ["# Known Locations", "", `**Units**: ${units}`, ""];
       if (locations.length === 0) {
-        lines.push("No named locations found in drive history for this range.");
+        lines.push("No locations found in drive history for this range.");
       } else {
+        const hasInferred = locations.some((loc) => !loc.named);
         for (const loc of locations) {
+          // Mark entries inferred from repeated addresses so a tagged Home is
+          // never confused with a frequently-visited untagged place.
+          const marker = loc.named ? "" : " _(inferred from address)_";
           lines.push(
-            `- **${loc.name}** — ${loc.visits} visits (${loc.as_start} starts, ${loc.as_end} ends)`
+            `- **${loc.name}** — ${loc.visits} visits (${loc.as_start} starts, ${loc.as_end} ends)${marker}`
+          );
+        }
+        if (hasInferred) {
+          lines.push(
+            "",
+            '_Entries marked "inferred from address" are frequently-visited ' +
+              "places derived from repeated drive addresses, not TeslaFi-tagged " +
+              "locations (which carry a name). The `named` flag in JSON output " +
+              "distinguishes them._"
           );
         }
       }

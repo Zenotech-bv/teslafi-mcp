@@ -16,7 +16,7 @@ const MAX_RETRY_AFTER_MS = 60000;
  * the version is never hardcoded in two places that can silently drift. Must
  * match package.json and manifest.json (asserted by a test).
  */
-export const VERSION = "2.4.0";
+export const VERSION = "2.5.0";
 
 /**
  * Shared env-flag truthiness test: an environment variable is "on" only when it
@@ -234,6 +234,15 @@ export interface LocationSummary {
   visits: number;
   as_start: number;
   as_end: number;
+  /**
+   * True for owner-tagged TeslaFi locations — a place carrying a non-empty
+   * locationName/startingLocationName (Home, Work, a named Supercharger).
+   * False for entries INFERRED from repeated raw visits: an untagged address
+   * the owner visits often, grouped by its stable locationKey/startingLocationKey
+   * with a display name derived from the address. Lets a client distinguish the
+   * two without re-deriving it.
+   */
+  named: boolean;
 }
 
 /** Last-known monthly quota counters, as reported by TeslaFi. */
@@ -631,35 +640,92 @@ class TeslaFIAPI {
 
   /**
    * Derive the set of known locations from stored drive history.
+   *
+   * Two kinds of entry are produced (distinguished by the `named` flag):
+   *   - NAMED (named=true): owner-tagged TeslaFi locations — an endpoint with a
+   *     non-empty locationName/startingLocationName (Home, Work, a named
+   *     Supercharger). Aggregated by that name, exactly as before.
+   *   - INFERRED (named=false): a place the owner visits repeatedly but has NOT
+   *     tagged+named in TeslaFi, so its name field is "". Rather than dropping
+   *     it (the old behavior, which hid frequently-visited untagged places),
+   *     it is grouped by the stable per-address key (locationKey for the end
+   *     endpoint, startingLocationKey for the start endpoint) with a readable
+   *     display name derived from the address.
+   *
+   * Named and inferred group keys are namespaced ("name:" vs "key:") so they can
+   * never collide. An endpoint is skipped only when its name AND its key AND its
+   * address are all empty (genuinely unidentifiable).
    */
   async getLocations(range: HistoryDateRange = {}): Promise<LocationSummary[]> {
     const drives = await this.getDrives(range);
-    const byName = new Map<string, LocationSummary>();
+    const byKey = new Map<string, LocationSummary>();
 
-    const record = (name: string, role: "start" | "end") => {
-      const clean = (name || "").trim();
-      if (!clean || clean.toLowerCase() === "unknown") {
-        return;
+    const record = (
+      name: string,
+      key: string,
+      address: string,
+      role: "start" | "end"
+    ) => {
+      const cleanName = (name || "").trim();
+      const isNamed =
+        cleanName !== "" && cleanName.toLowerCase() !== "unknown";
+
+      let mapKey: string;
+      let displayName: string;
+      if (isNamed) {
+        // Group tagged locations by their exact (trimmed) name, as before.
+        mapKey = `name:${cleanName}`;
+        displayName = cleanName;
+      } else {
+        // Untagged endpoint: fall back to the stable per-address key so a
+        // frequently-visited place is still surfaced. Prefer the address for a
+        // readable display name; fall back to the raw key only when no address
+        // is present. Skip entirely when neither key nor address identifies it.
+        const cleanKey = (key || "").trim();
+        const cleanAddress = (address || "").trim();
+        if (cleanKey === "" && cleanAddress === "") {
+          return;
+        }
+        const groupKey = cleanKey !== "" ? cleanKey : cleanAddress;
+        mapKey = `key:${groupKey}`;
+        displayName =
+          cleanAddress !== "" ? inferLocationName(cleanAddress) : cleanKey;
       }
+
       const existing =
-        byName.get(clean) ??
-        { name: clean, visits: 0, as_start: 0, as_end: 0 };
+        byKey.get(mapKey) ??
+        {
+          name: displayName,
+          visits: 0,
+          as_start: 0,
+          as_end: 0,
+          named: isNamed
+        };
       existing.visits++;
       if (role === "start") {
         existing.as_start++;
       } else {
         existing.as_end++;
       }
-      byName.set(clean, existing);
+      byKey.set(mapKey, existing);
     };
 
     for (const drive of drives) {
-      // Only count named saved locations, not raw street addresses.
-      record(getField(drive, ["startingLocationName"], ""), "start");
-      record(getField(drive, ["locationName"], ""), "end");
+      record(
+        getField(drive, ["startingLocationName"], ""),
+        getField(drive, ["startingLocationKey"], ""),
+        getField(drive, ["startingAddress"], ""),
+        "start"
+      );
+      record(
+        getField(drive, ["locationName"], ""),
+        getField(drive, ["locationKey"], ""),
+        getField(drive, ["address"], ""),
+        "end"
+      );
     }
 
-    return Array.from(byName.values()).sort((a, b) => b.visits - a.visits);
+    return Array.from(byKey.values()).sort((a, b) => b.visits - a.visits);
   }
 
   // ---------------------------------------------------------------------------
@@ -1440,6 +1506,29 @@ function getField<T>(
     }
   }
   return fallback;
+}
+
+/**
+ * Derive a human-readable display name from a raw TeslaFi address, for a place
+ * the owner visits repeatedly but has not tagged+named inside TeslaFi. Takes the
+ * first one-to-two comma-separated segments (typically street, then town), which
+ * reads far better than the full address or the raw locationKey, and falls back
+ * to the full trimmed address when segmentation is unhelpful (no usable
+ * segments). Fully deterministic (no Date/random) so repeated runs are stable.
+ */
+export function inferLocationName(address: string): string {
+  const full = (address || "").trim();
+  if (full === "") {
+    return full;
+  }
+  const segments = full
+    .split(",")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== "");
+  if (segments.length === 0) {
+    return full;
+  }
+  return segments.slice(0, 2).join(", ");
 }
 
 function isValidDate(d: Date): boolean {

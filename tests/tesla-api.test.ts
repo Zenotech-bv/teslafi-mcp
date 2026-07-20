@@ -13,6 +13,7 @@ import TeslaFIAPI, {
   cToF,
   envFlagEnabled,
   indicatesUnsentAsleep,
+  inferLocationName,
   isMonthlyAllowanceError,
   isNewerVersion,
   MAX_ANALYSIS_TRIPS,
@@ -1491,13 +1492,17 @@ describe("service method happy paths", () => {
     expect(result.trips_truncated).toBe(true);
   });
 
-  it("getLocations aggregates named locations, skipping addresses and Unknown", async () => {
+  it("getLocations aggregates tagged (named) locations, each flagged named=true", async () => {
     mockAxios.mockResolvedValue({
       data: [
-        { ...DRIVE, startingLocationName: "Home", locationName: "Acme HQ" },
-        { ...DRIVE, startingLocationName: "Home", locationName: "" },
-        { ...DRIVE, startingLocationName: "Acme HQ", locationName: "Home" },
-        { ...DRIVE, startingLocationName: "unknown", locationName: "Home" }
+        // startingAddress is blanked so empty/"unknown"-named endpoints with no
+        // key or address are genuinely unidentifiable and skipped.
+        { ...DRIVE, startingLocationName: "Home", startingAddress: "", locationName: "Acme HQ" },
+        { ...DRIVE, startingLocationName: "Acme HQ", startingAddress: "", locationName: "Home" },
+        // Empty end name, no key/address -> unidentifiable -> skipped.
+        { ...DRIVE, startingLocationName: "Home", startingAddress: "", locationName: "" },
+        // "unknown" start name, no key/address -> skipped.
+        { ...DRIVE, startingLocationName: "unknown", startingAddress: "", locationName: "Home" }
       ]
     });
     const locations = await settle(
@@ -1509,9 +1514,133 @@ describe("service method happy paths", () => {
       dateTo: "2026-07-31"
     });
     expect(locations).toEqual([
-      { name: "Home", visits: 4, as_start: 2, as_end: 2 },
-      { name: "Acme HQ", visits: 2, as_start: 1, as_end: 1 }
+      { name: "Home", visits: 4, as_start: 2, as_end: 2, named: true },
+      { name: "Acme HQ", visits: 2, as_start: 1, as_end: 1, named: true }
     ]);
+  });
+
+  it("surfaces frequently-visited UNTAGGED locations via locationKey (named=false)", async () => {
+    const dorsettAddress = "9 Dorsett Road, Talbot Green, Pontyclun CF72 8XY, UK";
+    const drive = (over: Record<string, unknown>) => ({ ...DRIVE, ...over });
+
+    const drives = [
+      // 9 drives Home -> 9 Dorsett Road (untagged end: name "", key set).
+      ...Array.from({ length: 9 }, () =>
+        drive({
+          startingLocationName: "Home",
+          locationName: "",
+          locationKey: "9DorsettRo",
+          address: dorsettAddress
+        })
+      ),
+      // 9 drives 9 Dorsett Road (untagged start) -> Home.
+      ...Array.from({ length: 9 }, () =>
+        drive({
+          startingLocationName: "",
+          startingLocationKey: "9DorsettRo",
+          startingAddress: dorsettAddress,
+          locationName: "Home"
+        })
+      ),
+      // 6 drives Home -> Supercharger (tagged).
+      ...Array.from({ length: 6 }, () =>
+        drive({
+          startingLocationName: "Home",
+          locationName: "Pontprennau Supercharger"
+        })
+      ),
+      // 5 drives Supercharger -> Home.
+      ...Array.from({ length: 5 }, () =>
+        drive({
+          startingLocationName: "Pontprennau Supercharger",
+          locationName: "Home"
+        })
+      )
+    ];
+    expect(drives).toHaveLength(29);
+
+    mockAxios.mockResolvedValue({ data: drives });
+    const locations = await settle(api.getLocations());
+
+    // The untagged Dorsett Road address is now surfaced, grouped by locationKey
+    // across BOTH roles (9 as start + 9 as end), with a readable inferred name.
+    const inferred = locations.filter((l) => !l.named);
+    expect(inferred).toEqual([
+      {
+        name: "9 Dorsett Road, Talbot Green",
+        visits: 18,
+        as_start: 9,
+        as_end: 9,
+        named: false
+      }
+    ]);
+
+    // Tagged locations still appear, flagged named=true.
+    const home = locations.find((l) => l.name === "Home");
+    expect(home).toMatchObject({ named: true, visits: 29, as_start: 15, as_end: 14 });
+    const supercharger = locations.find(
+      (l) => l.name === "Pontprennau Supercharger"
+    );
+    expect(supercharger).toMatchObject({ named: true, visits: 11 });
+
+    // Sorted by visits desc.
+    expect(locations.map((l) => l.name)).toEqual([
+      "Home",
+      "9 Dorsett Road, Talbot Green",
+      "Pontprennau Supercharger"
+    ]);
+  });
+
+  it("groups an untagged locationKey stably across start and end roles", async () => {
+    mockAxios.mockResolvedValue({
+      data: [
+        // Same place (key "9DorsettRo") as an END on one drive...
+        {
+          ...DRIVE,
+          startingLocationName: "Home",
+          startingAddress: "",
+          locationName: "",
+          locationKey: "9DorsettRo",
+          address: "9 Dorsett Road, Talbot Green"
+        },
+        // ...and as a START on another: they must merge into ONE entry.
+        {
+          ...DRIVE,
+          startingLocationName: "",
+          startingLocationKey: "9DorsettRo",
+          startingAddress: "9 Dorsett Road, Talbot Green",
+          locationName: "Home"
+        }
+      ]
+    });
+    const locations = await settle(api.getLocations());
+    const inferred = locations.filter((l) => !l.named);
+    expect(inferred).toHaveLength(1);
+    expect(inferred[0]).toEqual({
+      name: "9 Dorsett Road, Talbot Green",
+      visits: 2,
+      as_start: 1,
+      as_end: 1,
+      named: false
+    });
+  });
+
+  it("skips an endpoint with no name, key, or address (unidentifiable)", async () => {
+    mockAxios.mockResolvedValue({
+      data: [
+        {
+          ...DRIVE,
+          startingLocationName: "",
+          startingAddress: "",
+          startingLocationKey: "",
+          locationName: "",
+          address: "",
+          locationKey: ""
+        }
+      ]
+    });
+    const locations = await settle(api.getLocations());
+    expect(locations).toEqual([]);
   });
 
   it("sendCommand returns the unwrapped TeslaFi response", async () => {
@@ -2126,12 +2255,45 @@ describe("UpdateChecker: fire-and-forget failure swallowing", () => {
 });
 
 // ---------------------------------------------------------------------------
+// inferLocationName: readable display name from a raw address (deterministic)
+// ---------------------------------------------------------------------------
+
+describe("inferLocationName", () => {
+  it("takes the first one-to-two comma-separated segments", () => {
+    expect(
+      inferLocationName("9 Dorsett Road, Talbot Green, Pontyclun CF72 8XY, UK")
+    ).toBe("9 Dorsett Road, Talbot Green");
+  });
+
+  it("trims each segment and ignores empty ones", () => {
+    expect(inferLocationName("  A ,  B , C ")).toBe("A, B");
+    expect(inferLocationName("A,,B")).toBe("A, B");
+  });
+
+  it("returns the full address when there is a single usable segment", () => {
+    expect(inferLocationName("Somewhere")).toBe("Somewhere");
+    expect(inferLocationName("Supercharger A1")).toBe("Supercharger A1");
+  });
+
+  it("returns empty string for empty/whitespace input", () => {
+    expect(inferLocationName("")).toBe("");
+    expect(inferLocationName("   ")).toBe("");
+  });
+
+  it("is deterministic across repeated calls", () => {
+    const address = "12 High St, Cardiff, Wales";
+    expect(inferLocationName(address)).toBe(inferLocationName(address));
+    expect(inferLocationName(address)).toBe("12 High St, Cardiff");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // VERSION source of truth
 // ---------------------------------------------------------------------------
 
 describe("VERSION constant", () => {
-  it("is the exported single source of truth (2.4.0)", () => {
-    expect(VERSION).toBe("2.4.0");
+  it("is the exported single source of truth (2.5.0)", () => {
+    expect(VERSION).toBe("2.5.0");
     // A default-constructed checker compares against VERSION.
     const checker = new UpdateChecker();
     expect(isNewerVersion("9.9.9", VERSION)).toBe(true);

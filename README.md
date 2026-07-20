@@ -37,7 +37,8 @@ the underlying data in ways no fixed dashboard can.
 **Commutes & places**
 
 - "How many times did I commute to the office last month?"
-- "What are my ten most-visited places this year?"
+- "What are my ten most-visited places this year?" (includes places you've
+  never tagged in TeslaFi — inferred from repeated addresses)
 - "Which weekdays did I work from home in June?"
 
 **Reports & analysis** (the client combines tools and does the math)
@@ -68,7 +69,7 @@ the underlying data in ways no fixed dashboard can.
 | `tesla_get_charges` | Stored charge sessions, with optional date-range filtering. |
 | `tesla_get_trips_for_month` | All drives in a given calendar month, normalized. |
 | `tesla_analyze_home_work_trips` | Count home-to-work and work-to-home commutes in a month (e.g. Home ↔ Acme HQ). |
-| `tesla_get_locations` | Unique named locations and visit counts derived from drive history. |
+| `tesla_get_locations` | Unique locations and visit counts derived from drive history — both TeslaFi-tagged locations (`named: true`, e.g. Home/Work/Superchargers) and **frequently-visited untagged addresses** inferred from repeated drives (`named: false`). |
 | `tesla_send_command` | Send a vehicle control command — **disabled by default**, see [Vehicle commands](#vehicle-commands-opt-in). Car commands **never wake a sleeping car** unless you pass `wake_seconds` or `no_wake: false`. |
 
 ### Units
