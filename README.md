@@ -204,6 +204,7 @@ All configuration is via environment variables:
 | `TESLAFI_ENABLE_COMMANDS` | No | unset (off) | Enables the `tesla_send_command` tool. Only `true`, `1`, or `yes` (case-insensitive) enable it; **any other value keeps the server read-only**. |
 | `TESLAFI_UNITS` | No | unset (Automatic) | Default unit system for physical quantities when a tool call omits `units`. `metric` or `imperial` (case-insensitive) pins a default; **any other value** (including the extension's "Automatic") defers to your TeslaFi account's `measure` setting, then metric. The OS locale is **not** visible to the server, so this is the documented way for a client to pin a default without passing `units` on every call. |
 | `TESLAFI_CACHE_TTL_SECONDS` | No | `60` | TTL of the in-memory history cache, in seconds. Set to `0` to disable caching; invalid values fall back to the default. |
+| `TESLAFI_CHECK_UPDATES` | No | unset (off) | Opt in to a check for a newer GitHub release. Only `true`, `1`, or `yes` (case-insensitive) enable it; **any other value keeps it off**. When on, the server makes a single **unauthenticated** request to `api.github.com` (no TeslaFi token or data sent) and, if a newer release exists, appends a one-line notice to data-tool markdown output **once per session**. See [Update checks (opt-in)](#update-checks-opt-in). |
 
 \* One of the two token variables must be set; `TESLA_API_TOKEN` takes
 precedence.
@@ -331,6 +332,38 @@ The server is quota-careful on top of that:
   the exact error payload, so the match is heuristic; ordinary auth or
   malformed-request errors are never classified this way.)
 
+### Update checks (opt-in)
+
+The server can tell you when a newer release is available, but this is **off by
+default** because it adds a second network destination.
+
+- **How to enable it** — set `TESLAFI_CHECK_UPDATES=true` (or `1`/`yes`) in the
+  server's environment, or tick **Check for updates** when installing the
+  extension bundle (it maps to the same variable). Any other value keeps it off.
+- **What it does** — when enabled, the server makes a single **unauthenticated**
+  `GET` to
+  `https://api.github.com/repos/Zenotech-bv/teslafi-mcp/releases/latest`, reads
+  the release `tag_name`, and compares it to the running version using a numeric
+  `major.minor.patch` comparison. If a release is **strictly newer**, a one-line
+  notice is appended to the markdown output of the next data tool, e.g.:
+
+  > ℹ️ A newer TeslaFi MCP release is available: v2.5.0 (you have v2.4.0) — <https://github.com/Zenotech-bv/teslafi-mcp/releases>
+
+  The notice appears **at most once per session** and **never** in
+  `response_format: "json"` output, so JSON stays pure and parseable.
+- **What it never sends** — the GitHub request carries **no** TeslaFi token,
+  **no** `Authorization` header, and **no** TeslaFi data of any kind. It follows
+  no redirects (`maxRedirects: 0`) and honors no proxy (`proxy: false`), just
+  like the TeslaFi requests. The result is kept in memory only; nothing is
+  written to disk.
+- **Fail-safe** — the check is fire-and-forget: any failure (network error,
+  timeout, rate limit, malformed response) is silently ignored and never affects
+  a tool result. When disabled, **no** GitHub request is ever made and the only
+  network destination remains `www.teslafi.com`.
+- **Private-repo note** — while the repository is private, GitHub returns
+  **404** to unauthenticated callers, which is swallowed as "no update"; the
+  notice therefore only ever appears once the repository is public.
+
 ## Performance notes
 
 - **History caching** — `history.php` responses (drives and charges) are cached
@@ -366,12 +399,17 @@ The server is quota-careful on top of that:
 - **Zero telemetry** — no analytics, no crash reporting, no phoning home.
 - **No data retention** — responses are passed to your MCP client and then
   discarded.
-- **Single network destination** — the only host this server ever contacts is
-  `www.teslafi.com`, over HTTPS. HTTP redirects are never followed
-  (`maxRedirects: 0`), so even a server-issued redirect cannot send the
-  token-bearing request to another host or downgrade it to plain HTTP. Proxy
-  environment variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) are ignored
-  (`proxy: false`), so requests always go directly to `www.teslafi.com`.
+- **Single network destination (by default)** — by default the only host this
+  server ever contacts is `www.teslafi.com`, over HTTPS. HTTP redirects are
+  never followed (`maxRedirects: 0`), so even a server-issued redirect cannot
+  send the token-bearing request to another host or downgrade it to plain HTTP.
+  Proxy environment variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) are
+  ignored (`proxy: false`), so requests always go directly to `www.teslafi.com`.
+  **The one exception is opt-in:** enabling `TESLAFI_CHECK_UPDATES` additionally
+  contacts `api.github.com` — unauthenticated, with **no** TeslaFi token or data
+  sent, and with the same `maxRedirects: 0` / `proxy: false` hardening — solely
+  to read the latest release tag. It is off by default; see
+  [Update checks (opt-in)](#update-checks-opt-in).
 - **Read-only by default** — vehicle commands require the explicit
   `TESLAFI_ENABLE_COMMANDS=true` opt-in described above.
 - **Token handling** — your token is never written to logs, error messages, or

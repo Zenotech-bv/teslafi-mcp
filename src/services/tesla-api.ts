@@ -11,6 +11,27 @@ const MAX_RETRIES = 2;
 const MAX_RETRY_AFTER_MS = 60000;
 
 /**
+ * Single source of truth for the running server version. Consumed by the
+ * McpServer constructor (src/index.ts) AND the opt-in update check below, so
+ * the version is never hardcoded in two places that can silently drift. Must
+ * match package.json and manifest.json (asserted by a test).
+ */
+export const VERSION = "2.4.0";
+
+/**
+ * Shared env-flag truthiness test: an environment variable is "on" only when it
+ * is exactly "true", "1", or "yes" (case-insensitive, trimmed). Every other
+ * value — unset, "", "false", "0", "no", anything else — is off. This is the
+ * one rule behind both opt-ins (TESLAFI_ENABLE_COMMANDS for vehicle commands
+ * and TESLAFI_CHECK_UPDATES for the update check), so they can never diverge in
+ * how they read their flag.
+ */
+export function envFlagEnabled(value: string | null | undefined): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
+
+/**
  * Allowlist of TeslaFi feed.php commands and the extra query parameters each
  * command accepts, matching TeslaFi's official API documentation (the command
  * list shown on the logged-in API settings page at https://teslafi.com/api.php).
@@ -1736,6 +1757,208 @@ export function selectDriveUnitFields(
   emitFromBar("tpms_avg", "tpmsAvg");
   out.drive_kwh = parseNumOrNull(d.driveKwh); // kWh never converts
   return out;
+}
+
+// -----------------------------------------------------------------------------
+// Opt-in update check (off by default; a single standalone GitHub GET)
+// -----------------------------------------------------------------------------
+
+/**
+ * The ONLY GitHub endpoint this feature ever contacts. Hardcoded (never built
+ * from any input) and unauthenticated: the request carries no TeslaFi token, no
+ * Authorization header, and no TeslaFi data of any kind.
+ */
+const GITHUB_LATEST_RELEASE_URL =
+  "https://api.github.com/repos/Zenotech-bv/teslafi-mcp/releases/latest";
+
+/** Human-facing releases page linked from the update notice. */
+const RELEASES_PAGE_URL = "https://github.com/Zenotech-bv/teslafi-mcp/releases";
+
+/** Short timeout: the check must never delay or block anything meaningfully. */
+const UPDATE_CHECK_TIMEOUT_MS = 5000;
+
+interface SemVer {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/**
+ * Parse a semantic version, tolerating a leading "v" and ignoring any
+ * pre-release / build-metadata suffix (everything from the first "-" or "+").
+ * Returns null for anything that is not a clean numeric major.minor.patch, so a
+ * malformed or missing tag is treated as "no version".
+ */
+export function parseSemver(version: unknown): SemVer | null {
+  if (typeof version !== "string") {
+    return null;
+  }
+  let s = version.trim();
+  if (s === "") {
+    return null;
+  }
+  if (s[0] === "v" || s[0] === "V") {
+    s = s.slice(1);
+  }
+  // Drop any pre-release ("-beta.1") or build ("+build.5") suffix.
+  const core = s.split(/[-+]/)[0];
+  const match = core.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (
+    !Number.isInteger(major) ||
+    !Number.isInteger(minor) ||
+    !Number.isInteger(patch)
+  ) {
+    return null;
+  }
+  return { major, minor, patch };
+}
+
+/**
+ * Numeric (not lexical) semver comparison: returns true only when `latest` is
+ * STRICTLY newer than `current` (so 10.0.0 > 9.9.9). A malformed/missing tag on
+ * either side, or an equal/older latest, returns false (no update).
+ */
+export function isNewerVersion(latest: unknown, current: unknown): boolean {
+  const a = parseSemver(latest);
+  const b = parseSemver(current);
+  if (!a || !b) {
+    return false;
+  }
+  if (a.major !== b.major) {
+    return a.major > b.major;
+  }
+  if (a.minor !== b.minor) {
+    return a.minor > b.minor;
+  }
+  return a.patch > b.patch;
+}
+
+/** Strip a leading "v" and any pre-release/build suffix, for display. */
+function displayVersion(tag: string): string {
+  const parsed = parseSemver(tag);
+  return parsed ? `${parsed.major}.${parsed.minor}.${parsed.patch}` : tag;
+}
+
+/**
+ * Opt-in checker for a newer GitHub release. Deliberately self-contained and
+ * independent of the TeslaFi request pipeline: it NEVER reuses feedRequest /
+ * fetchHistory / requestWithRetry (all of which inject the TeslaFi token as a
+ * query param), and it sends no TeslaFi token, no Authorization header, and no
+ * TeslaFi data.
+ *
+ * Guarantees:
+ *   - OFF by default. With TESLAFI_CHECK_UPDATES not truthy, checkForUpdate()
+ *     makes ZERO network requests, preserving the "only destination is
+ *     www.teslafi.com" property.
+ *   - Fire-and-forget. Every failure — network error, timeout, 404 (a private
+ *     repo returns 404 unauthenticated), 403 (rate limit), malformed JSON — is
+ *     swallowed; it never throws into a tool handler or startup.
+ *   - In-memory only. The in-flight promise / result is cached for the process
+ *     lifetime; nothing is written to disk.
+ *   - Surfaced at most once per process, and only when strictly newer.
+ */
+export class UpdateChecker {
+  private readonly currentVersion: string;
+  /** Cached check promise for the process lifetime (in-memory only). */
+  private checkPromise: Promise<string | null> | null = null;
+  /** Latest release tag seen from GitHub, or null. */
+  private latestTag: string | null = null;
+  /** Whether the one-line notice has already been surfaced this process. */
+  private noticeShown = false;
+
+  constructor(currentVersion: string = VERSION) {
+    this.currentVersion = currentVersion;
+  }
+
+  /** Whether the opt-in flag enables the check (reuses the shared rule). */
+  private enabled(): boolean {
+    return envFlagEnabled(process.env.TESLAFI_CHECK_UPDATES);
+  }
+
+  /**
+   * Perform (once) the guarded standalone GitHub GET, or resolve null without
+   * any network request when disabled. Caches the promise so at most one
+   * request is ever made per process. Never rejects.
+   */
+  checkForUpdate(): Promise<string | null> {
+    if (!this.enabled()) {
+      // OFF by default: no GitHub request is ever made.
+      return Promise.resolve(null);
+    }
+    if (!this.checkPromise) {
+      this.checkPromise = this.performCheck();
+    }
+    return this.checkPromise;
+  }
+
+  private async performCheck(): Promise<string | null> {
+    try {
+      const response = await axios({
+        method: "GET",
+        url: GITHUB_LATEST_RELEASE_URL,
+        headers: {
+          "User-Agent": "teslafi-mcp-update-check",
+          Accept: "application/vnd.github+json"
+        },
+        // Same single-destination hardening as the TeslaFi client: never follow
+        // a redirect to another host, never honor an env-configured proxy.
+        maxRedirects: 0,
+        proxy: false,
+        timeout: UPDATE_CHECK_TIMEOUT_MS
+      });
+      const data: unknown = response?.data;
+      if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+        const tag = (data as Record<string, unknown>).tag_name;
+        if (typeof tag === "string" && tag.trim() !== "") {
+          this.latestTag = tag.trim();
+          return this.latestTag;
+        }
+      }
+      return null;
+    } catch {
+      // Fire-and-forget: swallow EVERYTHING (network error, timeout, 404 for a
+      // private repo, 403 rate limit, malformed JSON). Never throw.
+      return null;
+    }
+  }
+
+  /**
+   * The single one-line update notice, or null. Returns non-null AT MOST ONCE
+   * per process, and only when the feature is enabled and the last check found
+   * a strictly-newer release. Pure and synchronous; never throws. Callers
+   * append it to markdown output only (never JSON), mirroring the quota line.
+   */
+  maybeUpdateNotice(): string | null {
+    if (this.noticeShown || !this.enabled()) {
+      return null;
+    }
+    const tag = this.latestTag;
+    if (tag === null || !isNewerVersion(tag, this.currentVersion)) {
+      return null;
+    }
+    this.noticeShown = true;
+    return (
+      `ℹ️ A newer TeslaFi MCP release is available: v${displayVersion(tag)} ` +
+      `(you have v${this.currentVersion}) — ${RELEASES_PAGE_URL}`
+    );
+  }
+
+  /**
+   * Test hook: clear all in-memory state (cached promise, latest tag, and the
+   * shown-once flag) so both the "notice" and "no notice" paths can be
+   * exercised deterministically.
+   */
+  reset(): void {
+    this.checkPromise = null;
+    this.latestTag = null;
+    this.noticeShown = false;
+  }
 }
 
 export default TeslaFIAPI;

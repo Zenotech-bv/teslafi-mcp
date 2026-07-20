@@ -12,6 +12,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import axios, { AxiosError } from "axios";
 import { readFileSync } from "node:fs";
+import { VERSION } from "../src/services/tesla-api.js";
 
 const captured = vi.hoisted(() => ({
   tools: new Map<
@@ -176,14 +177,17 @@ function text(result: any): string {
   return result.content[0].text as string;
 }
 
+let indexModule: typeof import("../src/index.js");
+
 beforeAll(async () => {
   process.env.TESLA_API_TOKEN = TOKEN;
   delete process.env.TESLAFI_API_TOKEN;
   delete process.env.TESLAFI_ENABLE_COMMANDS;
   delete process.env.TESLAFI_CACHE_TTL_SECONDS;
+  delete process.env.TESLAFI_CHECK_UPDATES;
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   // Importing index.ts registers all tools on the fake server and runs main().
-  await import("../src/index.js");
+  indexModule = await import("../src/index.js");
 });
 
 beforeEach(() => {
@@ -195,6 +199,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   delete process.env.TESLAFI_ENABLE_COMMANDS;
+  delete process.env.TESLAFI_CHECK_UPDATES;
+  // Clear any update-check state so tests never leak a notice into each other.
+  indexModule.updateChecker.reset();
 });
 
 // ---------------------------------------------------------------------------
@@ -1221,12 +1228,124 @@ describe("account-measure resolution", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Opt-in update-check notice surfaced through the full tool path
+// ---------------------------------------------------------------------------
+
+describe("update-check notice (opt-in)", () => {
+  /** Route the api.github.com call to a given latest tag; TeslaFi as normal. */
+  function githubTag(tag: string) {
+    mockAxios.mockImplementation(async (config: any) => {
+      if (String(config?.url).includes("api.github.com")) {
+        return { data: { tag_name: tag } };
+      }
+      return defaultRoute(config);
+    });
+  }
+
+  it("makes no GitHub request and shows no notice when disabled (default)", async () => {
+    delete process.env.TESLAFI_CHECK_UPDATES;
+    indexModule.updateChecker.reset();
+    const md = text(await callTool("tesla_get_current_data"));
+    expect(md).not.toContain("newer TeslaFi MCP release");
+    // The only network destination remains www.teslafi.com.
+    for (const call of mockAxios.mock.calls) {
+      expect(String((call[0] as any)?.url)).not.toContain("api.github.com");
+    }
+  });
+
+  it("appends the one-line notice to markdown once, and never to JSON, when enabled+newer", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    indexModule.updateChecker.reset();
+    githubTag("v99.0.0");
+    await indexModule.updateChecker.checkForUpdate();
+    await vi.runAllTimersAsync();
+
+    // JSON output stays pure and parseable — the notice never appears there.
+    const jsonRes = await callTool("tesla_get_current_data", {
+      response_format: "json"
+    });
+    expect(() => JSON.parse(text(jsonRes))).not.toThrow();
+    expect(text(jsonRes)).not.toContain("newer TeslaFi MCP release");
+
+    // Markdown surfaces the notice exactly once.
+    const md = text(
+      await callTool("tesla_get_drives", {
+        date_from: "2026-07-20",
+        date_to: "2026-07-21"
+      })
+    );
+    expect(md).toContain(
+      "ℹ️ A newer TeslaFi MCP release is available: v99.0.0"
+    );
+    expect(md).toContain(`you have v${VERSION}`);
+    expect(md).toContain(
+      "https://github.com/Zenotech-bv/teslafi-mcp/releases"
+    );
+
+    // At most once per process: a later data tool no longer shows it.
+    const md2 = text(await callTool("tesla_get_current_data"));
+    expect(md2).not.toContain("newer TeslaFi MCP release");
+  });
+
+  it("shows no notice when the latest release is not newer", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    indexModule.updateChecker.reset();
+    githubTag(`v${VERSION}`); // same version
+    await indexModule.updateChecker.checkForUpdate();
+    await vi.runAllTimersAsync();
+    const md = text(await callTool("tesla_get_current_data"));
+    expect(md).not.toContain("newer TeslaFi MCP release");
+  });
+
+  it("keeps the GitHub request free of the TeslaFi token / Authorization", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    indexModule.updateChecker.reset();
+    githubTag("v99.0.0");
+    await indexModule.updateChecker.checkForUpdate();
+    await vi.runAllTimersAsync();
+
+    const githubCall = mockAxios.mock.calls.find((c) =>
+      String((c[0] as any)?.url).includes("api.github.com")
+    );
+    expect(githubCall).toBeDefined();
+    const cfg = githubCall![0] as any;
+    expect(cfg.url).toBe(
+      "https://api.github.com/repos/Zenotech-bv/teslafi-mcp/releases/latest"
+    );
+    expect(cfg.params).toBeUndefined(); // no token query param
+    expect(JSON.stringify(cfg)).not.toContain(TOKEN);
+    expect(cfg.headers.Authorization).toBeUndefined();
+    expect(cfg.maxRedirects).toBe(0);
+    expect(cfg.proxy).toBe(false);
+  });
+
+  it("tool output is unaffected when the check fails (swallowed)", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    indexModule.updateChecker.reset();
+    mockAxios.mockImplementation(async (config: any) => {
+      if (String(config?.url).includes("api.github.com")) {
+        throw new AxiosError("boom", "ENOTFOUND", {} as any);
+      }
+      return defaultRoute(config);
+    });
+    await indexModule.updateChecker.checkForUpdate();
+    await vi.runAllTimersAsync();
+    const md = text(await callTool("tesla_get_current_data"));
+    expect(md).toContain("# Vehicle Data (current)"); // still renders normally
+    expect(md).not.toContain("newer TeslaFi MCP release");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Manifest: TESLAFI_UNITS user_config + env wiring
 // ---------------------------------------------------------------------------
 
 describe("manifest user_config (units)", () => {
   const manifest = JSON.parse(
     readFileSync(new URL("../manifest.json", import.meta.url), "utf8")
+  );
+  const pkg = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8")
   );
 
   it("declares a units string field with an automatic default", () => {
@@ -1247,7 +1366,26 @@ describe("manifest user_config (units)", () => {
     );
   });
 
-  it("bumps the manifest version to 2.3.0", () => {
-    expect(manifest.version).toBe("2.3.0");
+  it("declares an enable_update_check boolean defaulting to false (valid MCPB)", () => {
+    const c = manifest.user_config.enable_update_check;
+    expect(c).toBeDefined();
+    expect(c.type).toBe("boolean");
+    expect(c.default).toBe(false);
+    expect(c.sensitive).toBe(false);
+    // Plain boolean only — the MCPB packer rejects enum / enum_labels here.
+    expect(c.enum).toBeUndefined();
+    expect(c.enum_labels).toBeUndefined();
+  });
+
+  it("wires TESLAFI_CHECK_UPDATES into the server env from user_config.enable_update_check", () => {
+    expect(manifest.server.mcp_config.env.TESLAFI_CHECK_UPDATES).toBe(
+      "${user_config.enable_update_check}"
+    );
+  });
+
+  it("keeps the VERSION constant, manifest, and package.json versions in lockstep (2.4.0)", () => {
+    expect(VERSION).toBe("2.4.0");
+    expect(manifest.version).toBe(VERSION);
+    expect(pkg.version).toBe(VERSION);
   });
 });

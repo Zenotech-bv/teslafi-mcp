@@ -11,19 +11,24 @@ import TeslaFIAPI, {
   barToPsi,
   CAR_COMMANDS,
   cToF,
+  envFlagEnabled,
   indicatesUnsentAsleep,
   isMonthlyAllowanceError,
+  isNewerVersion,
   MAX_ANALYSIS_TRIPS,
   miToKm,
   monthToDateRange,
   mphToKmh,
   mToFt,
   normalizeFeedData,
+  parseSemver,
   psiToBar,
   resolveUnits,
   selectDriveUnitFields,
   TESLAFI_COMMAND_NAMES,
-  TESLAFI_COMMAND_PARAMS
+  TESLAFI_COMMAND_PARAMS,
+  UpdateChecker,
+  VERSION
 } from "../src/services/tesla-api.js";
 
 vi.mock("axios", async (importOriginal) => {
@@ -99,12 +104,14 @@ beforeEach(() => {
   vi.useFakeTimers();
   mockAxios.mockReset();
   delete process.env.TESLAFI_CACHE_TTL_SECONDS;
+  delete process.env.TESLAFI_CHECK_UPDATES;
   api = new TeslaFIAPI(TOKEN);
 });
 
 afterEach(() => {
   vi.useRealTimers();
   delete process.env.TESLAFI_CACHE_TTL_SECONDS;
+  delete process.env.TESLAFI_CHECK_UPDATES;
 });
 
 // ---------------------------------------------------------------------------
@@ -1850,5 +1857,285 @@ describe("selectDriveUnitFields (history field selection)", () => {
     expect(m.efficiency_wh_km).toBeNull();
     expect(m.speed_avg_kmh).toBeNull();
     expect(m.speed_max_kmh).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared env-flag truthiness (TESLAFI_ENABLE_COMMANDS / TESLAFI_CHECK_UPDATES)
+// ---------------------------------------------------------------------------
+
+describe("envFlagEnabled", () => {
+  it.each([["true"], ["TRUE"], [" true "], ["1"], ["yes"], ["YES"]])(
+    "treats %j as enabled",
+    (value) => {
+      expect(envFlagEnabled(value)).toBe(true);
+    }
+  );
+
+  it.each([
+    [undefined],
+    [null],
+    [""],
+    ["   "],
+    ["false"],
+    ["FALSE"],
+    ["0"],
+    ["no"],
+    ["on"],
+    ["enabled"]
+  ])("treats %j as disabled", (value) => {
+    expect(envFlagEnabled(value as string | null | undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Semver numeric comparison (pure)
+// ---------------------------------------------------------------------------
+
+describe("semver compare (parseSemver / isNewerVersion)", () => {
+  it("compares numerically, not lexically (10.0.0 > 9.9.9)", () => {
+    expect(isNewerVersion("10.0.0", "9.9.9")).toBe(true);
+    expect(isNewerVersion("9.9.9", "10.0.0")).toBe(false);
+    expect(isNewerVersion("2.10.0", "2.9.9")).toBe(true);
+    expect(isNewerVersion("2.0.10", "2.0.9")).toBe(true);
+  });
+
+  it("strips a leading v (either side)", () => {
+    expect(isNewerVersion("v2.4.0", "2.3.0")).toBe(true);
+    expect(isNewerVersion("2.4.0", "v2.3.0")).toBe(true);
+    expect(isNewerVersion("V2.4.0", "v2.4.0")).toBe(false);
+  });
+
+  it("ignores a pre-release or build-metadata suffix", () => {
+    expect(isNewerVersion("2.4.0-beta.1", "2.3.0")).toBe(true);
+    expect(isNewerVersion("2.4.0+build.5", "2.3.0")).toBe(true);
+    // A pre-release of the SAME core version is not strictly newer.
+    expect(isNewerVersion("2.4.0-beta", "2.4.0")).toBe(false);
+    expect(parseSemver("v2.4.0-rc.2")).toEqual({ major: 2, minor: 4, patch: 0 });
+  });
+
+  it("treats equal or older as no update", () => {
+    expect(isNewerVersion("2.3.0", "2.3.0")).toBe(false);
+    expect(isNewerVersion("2.2.9", "2.3.0")).toBe(false);
+    expect(isNewerVersion("1.9.9", "2.0.0")).toBe(false);
+  });
+
+  it.each([
+    ["garbage"],
+    [""],
+    ["   "],
+    ["2.4"],
+    ["2.4.0.1"],
+    ["2.x.0"],
+    ["v"]
+  ])("treats malformed tag %j as no update", (tag) => {
+    expect(isNewerVersion(tag, "2.3.0")).toBe(false);
+    expect(parseSemver(tag)).toBeNull();
+  });
+
+  it("returns no update when the current version is malformed", () => {
+    expect(isNewerVersion("2.4.0", "not-a-version")).toBe(false);
+  });
+
+  it.each([[undefined], [null], [42], [{}]])(
+    "parseSemver returns null for non-string %j",
+    (value) => {
+      expect(parseSemver(value as unknown)).toBeNull();
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Opt-in update check (UpdateChecker): off by default, token-isolated,
+// fire-and-forget, surfaced at most once
+// ---------------------------------------------------------------------------
+
+const GITHUB_URL =
+  "https://api.github.com/repos/Zenotech-bv/teslafi-mcp/releases/latest";
+
+describe("UpdateChecker: off by default", () => {
+  it.each([
+    ["unset", undefined],
+    ['"false"', "false"],
+    ['"0"', "0"],
+    ['"no"', "no"],
+    ["empty", ""]
+  ])(
+    "makes ZERO GitHub requests when TESLAFI_CHECK_UPDATES is %s",
+    async (_label, value) => {
+      if (value === undefined) {
+        delete process.env.TESLAFI_CHECK_UPDATES;
+      } else {
+        process.env.TESLAFI_CHECK_UPDATES = value;
+      }
+      const checker = new UpdateChecker("2.3.0");
+      await expect(settle(checker.checkForUpdate())).resolves.toBeNull();
+      // The single-destination guarantee holds: no api.github.com request.
+      expect(mockAxios).not.toHaveBeenCalled();
+      expect(checker.maybeUpdateNotice()).toBeNull();
+    }
+  );
+});
+
+describe("UpdateChecker: token isolation and request shape", () => {
+  it("targets api.github.com with UA+Accept, no redirects/proxy, no token or Authorization", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockResolvedValue({ data: { tag_name: "v99.0.0" } });
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+    const cfg = axiosConfig();
+    // Exactly api.github.com's URL — never teslafi.com.
+    expect(cfg.url).toBe(GITHUB_URL);
+    expect(String(cfg.url)).not.toContain("teslafi.com");
+    expect(cfg.headers["User-Agent"]).toBe("teslafi-mcp-update-check");
+    expect(cfg.headers.Accept).toBe("application/vnd.github+json");
+    expect(cfg.maxRedirects).toBe(0);
+    expect(cfg.proxy).toBe(false);
+    expect(cfg.timeout).toBeLessThanOrEqual(5000);
+    expect(cfg.timeout).toBeGreaterThan(0);
+    // No TeslaFi token: no query params at all, and no token anywhere.
+    expect(cfg.params).toBeUndefined();
+    expect(JSON.stringify(cfg)).not.toContain("token");
+    expect(JSON.stringify(cfg)).not.toContain(TOKEN);
+    // No Authorization header, in any casing.
+    expect(cfg.headers.Authorization).toBeUndefined();
+    expect(cfg.headers.authorization).toBeUndefined();
+  });
+
+  it("does not use the TeslaFi request pipeline (no token param even alongside a TeslaFi call)", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockImplementation(async (config: any) => {
+      if (String(config?.url).includes("api.github.com")) {
+        return { data: { tag_name: "v99.0.0" } };
+      }
+      return { data: { battery_level: 72 } };
+    });
+    // A normal TeslaFi call carries the token...
+    await settle(api.getCurrentData());
+    // ...the update check, made independently, does not.
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+
+    const githubCall = mockAxios.mock.calls.find((c) =>
+      String((c[0] as any)?.url).includes("api.github.com")
+    );
+    expect(githubCall).toBeDefined();
+    const cfg = githubCall![0] as any;
+    expect(cfg.params).toBeUndefined();
+    expect(JSON.stringify(cfg)).not.toContain(TOKEN);
+  });
+});
+
+describe("UpdateChecker: notice surfacing", () => {
+  it("yields the one-line notice once, then null, for a strictly-newer release", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockResolvedValue({ data: { tag_name: "v99.1.2" } });
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+
+    const first = checker.maybeUpdateNotice();
+    expect(first).toContain("A newer TeslaFi MCP release is available");
+    expect(first).toContain("v99.1.2");
+    expect(first).toContain("you have v2.3.0");
+    expect(first).toContain(
+      "https://github.com/Zenotech-bv/teslafi-mcp/releases"
+    );
+    // At most once per process.
+    expect(checker.maybeUpdateNotice()).toBeNull();
+  });
+
+  it.each([["2.3.0"], ["2.2.0"], ["v2.3.0"], ["not-a-version"], [""]])(
+    "shows no notice for a non-newer / malformed tag %j",
+    async (tag) => {
+      process.env.TESLAFI_CHECK_UPDATES = "true";
+      mockAxios.mockResolvedValue({ data: { tag_name: tag } });
+      const checker = new UpdateChecker("2.3.0");
+      await settle(checker.checkForUpdate());
+      expect(checker.maybeUpdateNotice()).toBeNull();
+    }
+  );
+
+  it("caches the check for the process lifetime (one request only)", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockResolvedValue({ data: { tag_name: "v9.0.0" } });
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+    await settle(checker.checkForUpdate());
+    await settle(checker.checkForUpdate());
+    expect(mockAxios).toHaveBeenCalledTimes(1);
+  });
+
+  it("reset() restores both the request and the notice for re-exercising", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockResolvedValue({ data: { tag_name: "v9.0.0" } });
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+    expect(checker.maybeUpdateNotice()).toContain("v9.0.0");
+    expect(checker.maybeUpdateNotice()).toBeNull();
+
+    checker.reset();
+    await settle(checker.checkForUpdate());
+    expect(mockAxios).toHaveBeenCalledTimes(2); // fresh request after reset
+    expect(checker.maybeUpdateNotice()).toContain("v9.0.0"); // notice available again
+  });
+
+  it("suppresses the notice when the flag is turned off after a check", async () => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+    mockAxios.mockResolvedValue({ data: { tag_name: "v9.0.0" } });
+    const checker = new UpdateChecker("2.3.0");
+    await settle(checker.checkForUpdate());
+    process.env.TESLAFI_CHECK_UPDATES = "false";
+    expect(checker.maybeUpdateNotice()).toBeNull();
+  });
+});
+
+describe("UpdateChecker: fire-and-forget failure swallowing", () => {
+  beforeEach(() => {
+    process.env.TESLAFI_CHECK_UPDATES = "true";
+  });
+
+  it.each([
+    ["404 (private repo, unauthenticated)", () => httpError(404)],
+    ["403 (rate limited)", () => httpError(403)],
+    ["a redirect (302)", () => httpError(302)],
+    ["timeout", () => netError("ECONNABORTED")],
+    ["network error", () => netError("ENOTFOUND")]
+  ])("swallows %s: resolves null, never throws, no notice", async (_label, make) => {
+    mockAxios.mockRejectedValue(make());
+    const checker = new UpdateChecker("2.3.0");
+    await expect(settle(checker.checkForUpdate())).resolves.toBeNull();
+    expect(checker.maybeUpdateNotice()).toBeNull();
+  });
+
+  it.each([
+    ["a plain-text body", "You are not logged in"],
+    ["an HTML page", "<html><body>rate limited</body></html>"],
+    ["a null body", null],
+    ["an array body", [1, 2, 3]],
+    ["an object without tag_name", { name: "no tag here" }],
+    ["a non-string tag_name", { tag_name: 12345 }],
+    ["an empty tag_name", { tag_name: "" }]
+  ])("swallows malformed JSON (%s): no notice, no throw", async (_label, data) => {
+    mockAxios.mockResolvedValue({ data });
+    const checker = new UpdateChecker("2.3.0");
+    await expect(settle(checker.checkForUpdate())).resolves.toBeNull();
+    expect(checker.maybeUpdateNotice()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VERSION source of truth
+// ---------------------------------------------------------------------------
+
+describe("VERSION constant", () => {
+  it("is the exported single source of truth (2.4.0)", () => {
+    expect(VERSION).toBe("2.4.0");
+    // A default-constructed checker compares against VERSION.
+    const checker = new UpdateChecker();
+    expect(isNewerVersion("9.9.9", VERSION)).toBe(true);
+    expect(isNewerVersion(VERSION, VERSION)).toBe(false);
+    expect(checker).toBeInstanceOf(UpdateChecker);
   });
 });

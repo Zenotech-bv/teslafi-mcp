@@ -3,6 +3,42 @@
 All notable changes to the TeslaFi MCP server are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.0] — 2026-07-20
+
+### Added
+
+- **Opt-in update check (off by default).** A new `TESLAFI_CHECK_UPDATES`
+  environment variable (truthy only for `true`/`1`/`yes`, case-insensitive —
+  the same rule as `TESLAFI_ENABLE_COMMANDS`) enables a lightweight check for a
+  newer GitHub release. When on, the server makes a single **unauthenticated**
+  `GET` to `api.github.com/repos/Zenotech-bv/teslafi-mcp/releases/latest`,
+  compares the release tag to the running version using a numeric
+  `major.minor.patch` comparison (so `10.0.0 > 9.9.9`; a leading `v` and any
+  pre-release suffix are ignored), and — only when the release is strictly newer
+  — appends a single one-line notice to data-tool markdown output, at most once
+  per session. The notice never appears in `response_format: "json"` output, so
+  JSON stays pure and parseable.
+- **`enable_update_check` extension config.** `manifest.json` gains a plain
+  boolean `user_config.enable_update_check` (title "Check for updates", default
+  `false`), wired into `server.mcp_config.env` as `TESLAFI_CHECK_UPDATES`.
+- **Single `VERSION` source of truth.** The running version is now a single
+  exported constant consumed by both the `McpServer` constructor and the update
+  comparison, kept in lockstep with `package.json` and `manifest.json` by a test.
+
+### Security / privacy
+
+- The update check is a **standalone** request that never touches the TeslaFi
+  request pipeline: it sends **no** TeslaFi token, **no** `Authorization`
+  header, and **no** TeslaFi data, and reuses the same `maxRedirects: 0` /
+  `proxy: false` hardening. It is fire-and-forget (every failure — network
+  error, timeout, 404 for a private repo, 403 rate limit, malformed JSON — is
+  swallowed), in-memory only (zero disk writes), and **off by default**: when
+  disabled, no GitHub request is ever made and the only network destination
+  remains `www.teslafi.com`. A private repository returns 404 unauthenticated,
+  so the notice only appears once the repository is public.
+
+Not breaking: no tool parameters changed and all existing behavior is preserved.
+
 ## [2.3.0] — 2026-07-20
 
 ### Added

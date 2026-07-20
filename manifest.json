@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "teslafi-mcp",
   "display_name": "TeslaFi",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Query your TeslaFi vehicle data: live status, drive and charge history, home-to-work commute analysis, and opt-in vehicle commands.",
   "long_description": "An MCP server for the TeslaFi API. Exposes live/last-known vehicle data (feed.php), stored drive and charge history (history.php), home-to-work commute analysis built on drive history, and vehicle control commands (disabled by default; opt-in). Requires a TeslaFi API token from https://teslafi.com/api.php.",
   "author": {
@@ -20,7 +20,8 @@
       "env": {
         "TESLA_API_TOKEN": "${user_config.api_token}",
         "TESLAFI_ENABLE_COMMANDS": "${user_config.enable_commands}",
-        "TESLAFI_UNITS": "${user_config.units}"
+        "TESLAFI_UNITS": "${user_config.units}",
+        "TESLAFI_CHECK_UPDATES": "${user_config.enable_update_check}"
       }
     }
   },
@@ -45,6 +46,14 @@
       "description": "Maps to TESLAFI_UNITS. Default unit system for physical quantities when a tool call does not pass `units`. One of: automatic, metric, imperial. 'automatic' (the default) defers to your TeslaFi account's measure setting (then metric). The OS locale is not visible to the server, so this is the way to pin a default. 'metric' uses km, °C, bar; 'imperial' uses mi, °F, psi.",
       "sensitive": false,
       "default": "automatic",
+      "required": false
+    },
+    "enable_update_check": {
+      "type": "boolean",
+      "title": "Check for updates",
+      "description": "Maps to TESLAFI_CHECK_UPDATES. Opt-in and OFF by default. When on, the server makes a single unauthenticated request to api.github.com to read the latest release tag and, if a newer version exists, shows one short notice line in tool output. It sends NO TeslaFi token or vehicle data to GitHub, follows no redirects, and uses no proxy. Note: while the repository is private, GitHub returns 404 and no notice appears, so this only takes effect once the repo is public.",
+      "sensitive": false,
+      "default": false,
       "required": false
     }
   },

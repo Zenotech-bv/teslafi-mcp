@@ -20,18 +20,28 @@
  *     "automatic") defers to the TeslaFi account's measure setting, then metric.
  *   TESLAFI_CACHE_TTL_SECONDS               - Optional. In-memory history cache
  *     TTL in seconds (default: 60). Memory only - nothing is written to disk.
+ *   TESLAFI_CHECK_UPDATES                   - Optional. Set to "true" (or "1" /
+ *     "yes") to opt in to a lightweight check for a newer GitHub release. Off
+ *     by default: when unset/false NO GitHub request is ever made and the only
+ *     network destination remains www.teslafi.com. When on, the server makes a
+ *     single unauthenticated GET to api.github.com (no TeslaFi token or data
+ *     sent) and, if a newer release exists, appends a one-line notice to
+ *     data-tool markdown output once per session.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import TeslaFIAPI, {
+  envFlagEnabled,
   indicatesUnsentAsleep,
   normalizeFeedData,
   resolveUnits,
   selectDriveUnitFields,
   TeslaFiRecord,
   Trip,
-  UnitSystem
+  UnitSystem,
+  UpdateChecker,
+  VERSION
 } from "./services/tesla-api.js";
 import {
   AnalyzeHomeWorkTripsSchema,
@@ -53,8 +63,15 @@ import {
 // Initialize MCP server
 const server = new McpServer({
   name: "teslafi-mcp",
-  version: "2.3.0"
+  version: VERSION
 });
+
+/**
+ * Opt-in update checker (off unless TESLAFI_CHECK_UPDATES is truthy). Exported
+ * so tests can drive and reset it; the running server only fires it once at
+ * startup and reads maybeUpdateNotice() synchronously in the data tools.
+ */
+export const updateChecker = new UpdateChecker(VERSION);
 
 let teslaAPI: TeslaFIAPI;
 
@@ -72,8 +89,18 @@ function initializeTeslaAPI(): void {
 
 /** Whether the tesla_send_command tool is enabled (off by default). */
 function commandsEnabled(): boolean {
-  const value = (process.env.TESLAFI_ENABLE_COMMANDS ?? "").trim().toLowerCase();
-  return value === "true" || value === "1" || value === "yes";
+  return envFlagEnabled(process.env.TESLAFI_ENABLE_COMMANDS);
+}
+
+/**
+ * The opt-in update notice as markdown lines to append (blank separator + the
+ * one line), or an empty array. Off by default and shown at most once per
+ * process; mirrors how the quota line is added to markdown output only (never
+ * JSON), so JSON responses stay pure and parseable.
+ */
+function updateNoticeLines(): string[] {
+  const notice = updateChecker.maybeUpdateNotice();
+  return notice ? ["", notice] : [];
 }
 
 const COMMANDS_DISABLED_MESSAGE =
@@ -442,6 +469,8 @@ Example: "Analyze trips from Home to Acme HQ for July 2026"`,
         );
       }
 
+      lines.push(...updateNoticeLines());
+
       return toolResult(lines.join("\n"), output);
     } catch (error) {
       return errorResult(error);
@@ -553,6 +582,8 @@ Example: "Show me all trips from July 2026"`,
         );
       }
 
+      lines.push(...updateNoticeLines());
+
       return toolResult(lines.join("\n"), output);
     } catch (error) {
       return errorResult(error);
@@ -612,6 +643,8 @@ Example: "What locations does my car track?"`,
           );
         }
       }
+
+      lines.push(...updateNoticeLines());
 
       return toolResult(lines.join("\n"), output);
     } catch (error) {
@@ -732,6 +765,8 @@ Example: "What's my car's battery level right now?"`,
         lines.push("", quota);
       }
 
+      lines.push(...updateNoticeLines());
+
       return toolResult(lines.join("\n"), out);
     } catch (error) {
       return errorResult(error);
@@ -840,6 +875,8 @@ Example: "Show my drives between 2026-07-01 and 2026-07-07"`,
           `*More available. Use offset=${params.offset + params.limit}.*`
         );
       }
+
+      lines.push(...updateNoticeLines());
 
       return toolResult(lines.join("\n"), output);
     } catch (error) {
@@ -952,6 +989,8 @@ Example: "How much did I charge in July 2026?"`,
           `*More available. Use offset=${params.offset + params.limit}.*`
         );
       }
+
+      lines.push(...updateNoticeLines());
 
       return toolResult(lines.join("\n"), output);
     } catch (error) {
@@ -1093,6 +1132,12 @@ async function main(): Promise<void> {
   try {
     initializeTeslaAPI();
 
+    // Opt-in, fire-and-forget: kick off the update check at startup so the
+    // one-line notice can be surfaced by the first data tool that runs. When
+    // TESLAFI_CHECK_UPDATES is not truthy this makes no network request at all,
+    // and it never rejects, so startup is unaffected either way.
+    void updateChecker.checkForUpdate();
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
@@ -1103,9 +1148,12 @@ async function main(): Promise<void> {
     const commandState = commandsEnabled()
       ? "enabled (TESLAFI_ENABLE_COMMANDS)"
       : "disabled (read-only; set TESLAFI_ENABLE_COMMANDS=true to enable)";
+    const updateCheckState = envFlagEnabled(process.env.TESLAFI_CHECK_UPDATES)
+      ? "enabled (TESLAFI_CHECK_UPDATES; unauthenticated api.github.com, no TeslaFi data)"
+      : "disabled";
     console.error(
       `TeslaFi MCP server running. Token source: ${tokenSource}. ` +
-        `Vehicle commands: ${commandState}.`
+        `Vehicle commands: ${commandState}. Update check: ${updateCheckState}.`
     );
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);

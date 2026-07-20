@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| 2.3.x | Yes |
-| < 2.3 | No |
+| 2.4.x | Yes |
+| < 2.4 | No |
 
 Only the latest release receives security fixes. Please upgrade before
 reporting an issue against an older version.
@@ -70,3 +70,20 @@ the reserved `token`, `command`, `wake`, and `noWake` query keys can never be
 supplied as command parameters. Commands are also never
 retried once the request may have reached TeslaFi, so a transient network
 error cannot cause a command to execute twice.
+
+### Opt-in update check (second network destination)
+
+By default the only host this server contacts is `www.teslafi.com`. The
+`TESLAFI_CHECK_UPDATES` opt-in (off by default; accepted truthy values `true`,
+`1`, `yes`) adds **one** additional destination: a single **unauthenticated**
+`GET` to `api.github.com` to read the latest release tag.
+
+- It carries **no credentials and no data** — no TeslaFi token, no
+  `Authorization` header, and no vehicle data — and is built on a hardcoded URL,
+  never from user input.
+- It uses the same hardening as the TeslaFi requests: no redirects
+  (`maxRedirects: 0`) and no proxy (`proxy: false`).
+- It is fire-and-forget: every failure is swallowed and can never affect a tool
+  result, and the outcome is held in memory only (nothing is written to disk).
+- When the flag is not truthy, **no** GitHub request is ever made, preserving
+  the single-destination (`www.teslafi.com`-only) property.
