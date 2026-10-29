@@ -1480,8 +1480,8 @@ describe("manifest user_config (units)", () => {
     );
   });
 
-  it("keeps the VERSION constant, manifest, and package.json versions in lockstep (2.6.0)", () => {
-    expect(VERSION).toBe("2.6.0");
+  it("keeps the VERSION constant, manifest, and package.json versions in lockstep (2.6.1)", () => {
+    expect(VERSION).toBe("2.6.1");
     expect(manifest.version).toBe(VERSION);
     expect(pkg.version).toBe(VERSION);
   });

@@ -219,7 +219,7 @@ export const SendCommandSchema = z
           "Must also be enabled on the TeslaFi Commands tab."
       ),
     params: z
-      .record(z.union([z.string(), z.number(), z.boolean()]))
+      .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
       .optional()
       .describe(
         "Extra command parameters, validated per command. Examples: " +
