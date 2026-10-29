@@ -1,6 +1,6 @@
 {
   "name": "teslafi-mcp",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "MCP server for the TeslaFi API - live vehicle data, drive/charge history, commute analysis, and opt-in vehicle commands",
   "type": "module",
   "main": "dist/index.js",
@@ -35,7 +35,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",
     "axios": "^1.7.9",
-    "zod": "^3.25.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

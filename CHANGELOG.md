@@ -3,6 +3,20 @@
 All notable changes to the TeslaFi MCP server are documented in this file.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.1] — 2026-10-29
+
+### Security
+
+- **Dependencies updated; `npm audit` is clean (16 advisories before).** Within
+  the existing ranges: `@modelcontextprotocol/sdk` 1.32.2, `axios` 1.21.0,
+  `tsx`, `vitest` 4.1.12, `@types/node` and their transitive packages
+  (`hono`, `@hono/node-server`, `qs`, `follow-redirects`, `ip-address`,
+  `proxy-addr`, `fast-uri`, `body-parser`, `vite`, `postcss`, ...).
+- **`zod` 3 -> 4 (^4.6.7)** for GHSA-mrhx-c7xc-m3w5 (memory exhaustion while
+  validating oversized constrained collections), fixed only in 4.6.6+. The one
+  code change: `z.record` now names its key type. The published tool schemas
+  are equivalent (`date_to` is inlined instead of a `$ref`, `offset` gets
+  an explicit safe-integer maximum, `params` declares string keys).
 ## [2.6.0] — 2026-07-20
 
 ### Added

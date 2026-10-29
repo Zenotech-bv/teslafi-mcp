@@ -16,7 +16,7 @@ const MAX_RETRY_AFTER_MS = 60000;
  * the version is never hardcoded in two places that can silently drift. Must
  * match package.json and manifest.json (asserted by a test).
  */
-export const VERSION = "2.6.0";
+export const VERSION = "2.6.1";
 
 /**
  * Shared env-flag truthiness test: an environment variable is "on" only when it

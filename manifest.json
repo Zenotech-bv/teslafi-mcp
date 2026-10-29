@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "teslafi-mcp",
   "display_name": "TeslaFi",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "Query your TeslaFi vehicle data: live status, drive and charge history, home-to-work commute analysis, and opt-in vehicle commands.",
   "long_description": "An MCP server for the TeslaFi API. Exposes live/last-known vehicle data (feed.php), stored drive and charge history (history.php), home-to-work commute analysis built on drive history, and vehicle control commands (disabled by default; opt-in). Requires a TeslaFi API token from https://teslafi.com/api.php.",
   "author": {

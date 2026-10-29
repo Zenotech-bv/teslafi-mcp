@@ -2448,8 +2448,8 @@ describe("inferLocationName", () => {
 // ---------------------------------------------------------------------------
 
 describe("VERSION constant", () => {
-  it("is the exported single source of truth (2.6.0)", () => {
-    expect(VERSION).toBe("2.6.0");
+  it("is the exported single source of truth (2.6.1)", () => {
+    expect(VERSION).toBe("2.6.1");
     // A default-constructed checker compares against VERSION.
     const checker = new UpdateChecker();
     expect(isNewerVersion("9.9.9", VERSION)).toBe(true);
